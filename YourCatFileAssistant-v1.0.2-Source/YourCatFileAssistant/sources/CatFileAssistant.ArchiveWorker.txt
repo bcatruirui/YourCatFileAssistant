@@ -1,0 +1,1988 @@
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/ArchiveTemporaryJournal.cs ---
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (c) 2026 CatFileAssistant contributors.
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
+
+namespace CatFileAssistant.Ownership;
+
+/// <summary>An append-only receipt for archive staging. Paths which were moved to results are never followed.</summary>
+public sealed class ArchiveTemporaryJournal : IDisposable
+{
+    private sealed record Header(int Version, string Root);
+    private sealed record Entry(string Path, string Identity, bool Directory);
+    private readonly string root;
+    private readonly FileStream stream;
+    private readonly StreamWriter writer;
+    private readonly HashSet<string> owned = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object gate = new();
+
+    public static void Create(string journalPath, string workRoot)
+    {
+        workRoot = ValidateRoot(workRoot);
+        journalPath = Path.GetFullPath(journalPath);
+        if (!SafePath(journalPath)) throw new IOException("Archive journal path is unsafe.");
+        using var file = new FileStream(journalPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+        using var output = new StreamWriter(file, new UTF8Encoding(false));
+        output.WriteLine(JsonSerializer.Serialize(new Header(1, workRoot)));
+    }
+
+    public static ArchiveTemporaryJournal Open(string journalPath, string workRoot) => new(journalPath, workRoot);
+
+    private ArchiveTemporaryJournal(string journalPath, string workRoot)
+    {
+        root = ValidateRoot(workRoot);
+        if (!SafePath(journalPath)) throw new IOException("Archive journal path is unsafe.");
+        using (var input = new StreamReader(new FileStream(journalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)))
+        {
+            var header = JsonSerializer.Deserialize<Header>(input.ReadLine() ?? "");
+            if (header is null || header.Version != 1 || !string.Equals(header.Root, root, StringComparison.OrdinalIgnoreCase) || input.ReadLine() is not null)
+                throw new InvalidDataException("Archive journal is not a new task receipt.");
+        }
+        stream = new FileStream(journalPath, FileMode.Append, FileAccess.Write, FileShare.Read);
+        writer = new StreamWriter(stream, new UTF8Encoding(false)) { AutoFlush = true };
+    }
+
+    public void CreateDirectory(string path)
+    {
+        lock (gate)
+        {
+            path = UnderRoot(path);
+            if (owned.Contains(path)) return;
+            if (!string.Equals(path, root, StringComparison.OrdinalIgnoreCase)) CreateDirectory(Path.GetDirectoryName(path)!);
+            if (!SafePath(path)) throw new IOException("Archive temporary directory is unsafe.");
+            // Unlike Directory.CreateDirectory this does not silently claim a folder
+            // another application or the user created between the existence checks.
+            if (!CreateDirectoryNative(path, IntPtr.Zero)) throw new IOException("Archive staging folder already exists or could not be created.");
+            using var handle = OpenIdentity(path, directory: true, deleteAccess: true);
+            try { Record(path, handle, directory: true); }
+            catch { DeleteHandle(handle); throw; }
+        }
+    }
+
+    public FileStream CreateFile(string path, FileAccess access)
+    {
+        lock (gate)
+        {
+            path = UnderRoot(path);
+            CreateDirectory(Path.GetDirectoryName(path)!);
+            if (!SafePath(path)) throw new IOException("Archive temporary file is unsafe.");
+            // Delete access permits exact-handle cleanup if the receipt cannot be written.
+            var handle = CreateFileNative(path, 0x10000u | (access == FileAccess.Write ? 0x40000000u : 0xC0000000u), 0, IntPtr.Zero, 1, 0x00200000u, IntPtr.Zero);
+            if (handle.IsInvalid) { handle.Dispose(); throw new IOException("Cannot create archive staging file."); }
+            FileStream? file = null;
+            try
+            {
+                file = new FileStream(handle, access);
+                Record(path, handle, directory: false);
+                return file;
+            }
+            catch
+            {
+                DeleteHandle(handle);
+                if (file is not null) file.Dispose(); else handle.Dispose();
+                throw;
+            }
+        }
+    }
+
+    private void Record(string path, SafeFileHandle handle, bool directory)
+    {
+        writer.WriteLine(JsonSerializer.Serialize(new Entry(Path.GetRelativePath(root, path), Identity(handle), directory)));
+        // AutoFlush publishes complete lines to the OS before any archive bytes are
+        // written. A killed process cannot lose its managed writer buffer.
+        owned.Add(path);
+    }
+
+    /// <summary>Deletes only identities in this receipt. Unknown files keep their containing directories and receipt.</summary>
+    public static bool Cleanup(string journalPath)
+    {
+        try
+        {
+            if (!File.Exists(journalPath)) return true;
+            if (!SafePath(journalPath)) return false;
+            // OwnedArtifacts already holds a verified DELETE-capable journal
+            // handle while calling us, so this read must share that access.
+            using var input = new StreamReader(new FileStream(journalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete));
+            var header = JsonSerializer.Deserialize<Header>(input.ReadLine() ?? "");
+            if (header is null || header.Version != 1) return false;
+            var root = ValidateRoot(header.Root);
+            var entries = new List<Entry>();
+            var partial = false;
+            while (input.ReadLine() is { } line)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    var entry = JsonSerializer.Deserialize<Entry>(line);
+                    if (entry is null) return false;
+                    entries.Add(entry);
+                }
+                catch (JsonException)
+                {
+                    // A process can die halfway through its final append. Completed
+                    // earlier receipts remain usable; never infer an unrecorded file.
+                    if (!input.EndOfStream) return false;
+                    partial = true;
+                }
+            }
+            if (!Directory.Exists(root) && !File.Exists(root)) return true;
+            var rootEntry = entries.FirstOrDefault(entry => entry.Path == "." && entry.Directory);
+            if (rootEntry is null || !SafePath(root)) return false;
+            using (var rootHandle = OpenIdentity(root, directory: true, deleteAccess: false))
+                if (Identity(rootHandle) != rootEntry.Identity) return false;
+            var complete = true;
+            foreach (var entry in entries.OrderByDescending(entry => entry.Path.Length))
+            {
+                var path = Path.GetFullPath(Path.Combine(root, entry.Path));
+                if (!IsUnder(path, root) || !SafePath(path)) { complete = false; continue; }
+                if (!File.Exists(path) && !Directory.Exists(path)) continue;
+                try
+                {
+                    using var handle = OpenIdentity(path, entry.Directory, deleteAccess: true);
+                    if (Identity(handle) != entry.Identity) { complete = false; continue; }
+                    if (entry.Directory && Directory.EnumerateFileSystemEntries(path).Any()) { complete = false; continue; }
+                    DeleteHandle(handle);
+                }
+                catch (Exception error) when (error is IOException or UnauthorizedAccessException) { complete = false; }
+            }
+            return complete && !partial && !Directory.Exists(root) && !File.Exists(root);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or ArgumentException) { return false; }
+    }
+
+    private string UnderRoot(string path)
+    {
+        path = Path.GetFullPath(path);
+        if (!IsUnder(path, root)) throw new IOException("Archive temporary path is outside its task folder.");
+        return path;
+    }
+    private static bool IsUnder(string path, string root) => string.Equals(path, root, StringComparison.OrdinalIgnoreCase)
+        || path.StartsWith(Path.TrimEndingDirectorySeparator(root) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    private static string ValidateRoot(string path)
+    {
+        if (!Path.IsPathFullyQualified(path)) throw new IOException("Archive staging path must be absolute.");
+        path = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        if (!Path.GetFileName(path).StartsWith(".cat-archive-", StringComparison.Ordinal)) throw new IOException("Archive staging name is invalid.");
+        return path;
+    }
+    private static bool SafePath(string path)
+    {
+        for (var current = Path.GetFullPath(path); current is not null; current = Path.GetDirectoryName(current))
+            if ((File.Exists(current) || Directory.Exists(current)) && (File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) return false;
+        return true;
+    }
+    private static SafeFileHandle OpenIdentity(string path, bool directory, bool deleteAccess)
+    {
+        var handle = CreateFileNative(path, 0x80u | (deleteAccess ? 0x10000u : 0u), 7, IntPtr.Zero, 3, 0x00200000u | (directory ? 0x02000000u : 0u), IntPtr.Zero);
+        if (handle.IsInvalid) { handle.Dispose(); throw new IOException("Cannot open archive artifact identity."); }
+        return handle;
+    }
+    private static string Identity(SafeFileHandle handle)
+    {
+        if (!GetFileInformationByHandle(handle, out var info)) throw new IOException("Cannot read archive artifact identity.");
+        return $"{info.Volume:X8}-{info.IndexHigh:X8}{info.IndexLow:X8}-{info.CreationHigh:X8}{info.CreationLow:X8}";
+    }
+    private static void DeleteHandle(SafeFileHandle handle)
+    {
+        var disposition = new FileDisposition { Delete = true };
+        if (!SetFileInformationByHandle(handle, 4, ref disposition, (uint)Marshal.SizeOf<FileDisposition>())) throw new IOException("Cannot remove owned archive artifact.");
+    }
+    public void Dispose() { writer.Dispose(); stream.Dispose(); }
+    [StructLayout(LayoutKind.Sequential)] private struct FileInfo { public uint Attributes, CreationLow, CreationHigh, AccessLow, AccessHigh, WriteLow, WriteHigh, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow; }
+    [StructLayout(LayoutKind.Sequential)] private struct FileDisposition { [MarshalAs(UnmanagedType.Bool)] public bool Delete; }
+    [DllImport("kernel32.dll", EntryPoint = "CreateDirectoryW", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CreateDirectoryNative(string path, IntPtr security);
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)] private static extern SafeFileHandle CreateFileNative(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInfo info);
+    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int type, ref FileDisposition information, uint size);
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/Callbacks.cs ---
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (c) 2026 CatFileAssistant contributors.
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
+
+using CatFileAssistant.Ownership;
+
+namespace CatFileAssistant.ArchiveWorker;
+
+[ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+public sealed class OpenCallback : IArchiveOpenCallback, IArchiveOpenVolumeCallback, ICryptoGetTextPassword, IDisposable
+{
+    private readonly string _path;
+    private readonly string? _password;
+    private readonly CancellationToken _token;
+    private readonly List<InputStream> _streams = [];
+    private Exception? _error;
+    internal bool PasswordRequested { get; private set; }
+    internal bool MissingVolumeRequested { get; private set; }
+    internal Exception? Error
+    {
+        get => _error ?? _streams.Select(stream => stream.Error).FirstOrDefault(error => error is not null);
+        private set => _error = value;
+    }
+    internal OpenCallback(string path, string? password, CancellationToken token) { _path = path; _password = password; _token = token; }
+    public int SetTotal(IntPtr files, IntPtr bytes) => _token.IsCancellationRequested ? Native.Abort : Native.Ok;
+    public int SetCompleted(IntPtr files, IntPtr bytes) => _token.IsCancellationRequested ? Native.Abort : Native.Ok;
+    public int GetProperty(uint property, ref PropVariant value)
+    {
+        try
+        {
+            value = (Property)property switch { Property.Name => PropVariant.Text(Path.GetFileName(_path)), Property.Size => PropVariant.U64((ulong)new FileInfo(_path).Length), Property.IsDir => PropVariant.Flag(false), _ => default };
+            return Native.Ok;
+        }
+        catch (Exception ex) { Error = ex; return Native.Fail; }
+    }
+    public int GetStream(string name, out IInStream? stream)
+    {
+        stream = null;
+        try
+        {
+            _token.ThrowIfCancellationRequested();
+            string safe = Safety.RelativePath(name, 1);
+            if (!AllowedVolume(safe)) Safety.Unsafe("压缩包请求读取不属于当前档案的外部文件。");
+            string path = Safety.UnderRoot(Path.GetDirectoryName(_path)!, safe);
+            if (!File.Exists(path)) { MissingVolumeRequested = true; return Native.False; }
+            Safety.RejectReparse(path);
+            var opened = new InputStream(new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read), _token);
+            _streams.Add(opened); stream = opened; return Native.Ok;
+        }
+        catch (Exception ex) { Error = ex; return ex is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public int CryptoGetTextPassword(out IntPtr password)
+    {
+        password = IntPtr.Zero; PasswordRequested = true;
+        if (_token.IsCancellationRequested || _password is null) return Native.Abort;
+        try { password = Marshal.StringToBSTR(_password); return Native.Ok; }
+        catch (Exception ex) { Error = ex; return Native.Fail; }
+    }
+    private bool AllowedVolume(string name)
+    {
+        string original = Path.GetFileName(_path);
+        if (name.Equals(original, StringComparison.OrdinalIgnoreCase)) return true;
+        Match part = Regex.Match(original, @"^(.*)\.part[0-9]+\.rar$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (part.Success) return Regex.IsMatch(name, "^" + Regex.Escape(part.Groups[1].Value) + @"\.part[0-9]+\.rar$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        string stem = Path.GetFileNameWithoutExtension(original);
+        if (original.EndsWith(".rar", StringComparison.OrdinalIgnoreCase)) return Regex.IsMatch(name, "^" + Regex.Escape(stem) + @"\.[r-z][0-9]{2}$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (original.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)) return Regex.IsMatch(name, "^" + Regex.Escape(stem) + @"\.z[0-9]+$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        return false;
+    }
+    public void Dispose() { foreach (var stream in _streams) stream.Dispose(); }
+}
+
+[ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+public sealed class ExtractCallback : IArchiveExtractCallback, IProgress, ICryptoGetTextPassword, IDisposable
+{
+    private readonly IReadOnlyList<ArchiveEntry> _entries;
+    private readonly IReadOnlyDictionary<uint, ArchiveEntry> _entriesByIndex;
+    private readonly string? _destination;
+    private readonly string? _password;
+    private readonly CancellationToken _token;
+    private readonly ByteBudget _budget;
+    private readonly long _maximum;
+    private readonly string _stage;
+    private readonly Dictionary<uint, string>? _overrides;
+    private readonly ArchiveTemporaryJournal? _journal;
+    private OutputStream? _current;
+    private ArchiveEntry? _entry;
+    private int _completed;
+    private long? _total;
+    private readonly long? _expectedTotal;
+    private Exception? _error;
+    internal Exception? Error { get => _error ?? _current?.Error; private set => _error = value; }
+    internal bool PasswordRequested { get; private set; }
+    internal long WrittenBytes => _budget.Bytes;
+    internal ExtractCallback(IReadOnlyList<ArchiveEntry> entries, string? destination, string? password, CancellationToken token, ByteBudget budget, long maximum, string stage, Dictionary<uint, string>? overrides = null, ArchiveTemporaryJournal? journal = null)
+    { _entries = entries; _entriesByIndex = entries.ToDictionary(x => x.Index); _destination = destination; _password = password; _token = token; _budget = budget; _maximum = maximum; _stage = stage; _overrides = overrides; _journal = journal; _expectedTotal = entries.All(x => x.Size is not null) ? entries.Sum(x => x.Size ?? 0) : null; }
+    public int SetTotal(ulong total) { _total = total <= long.MaxValue ? (long)total : null; return _token.IsCancellationRequested ? Native.Abort : Native.Ok; }
+    public int SetCompleted(IntPtr completed)
+    {
+        if (_token.IsCancellationRequested) return Native.Abort;
+        // ByteBudget measures actual output; native progress can measure compressed input.
+        Protocol.Progress(_budget.Bytes, _expectedTotal, _completed, _entries.Count, _entry?.Path, _stage);
+        return Native.Ok;
+    }
+    public int GetStream(uint index, out ISequentialOutStream? stream, int askMode)
+    {
+        stream = null;
+        try
+        {
+            _token.ThrowIfCancellationRequested(); CloseCurrent(); _entry = null;
+            if (askMode != 0) return Native.Ok;
+            if (!_entriesByIndex.TryGetValue(index, out _entry)) throw new WorkerException("corrupt-archive", "压缩引擎请求了未校验的条目。");
+            if (_entry.IsDirectory)
+            {
+                if (_destination is not null)
+                {
+                    string directory = Safety.UnderRoot(_destination, _entry.Path); Safety.RejectReparse(directory); (_journal ?? throw new IOException("Archive receipt is missing.")).CreateDirectory(directory);
+                }
+                return Native.Ok;
+            }
+            Stream output;
+            if (_destination is null) output = Stream.Null;
+            else
+            {
+                string relative = _overrides is not null && _overrides.TryGetValue(index, out string? replacement) ? replacement : _entry.Path;
+                string target = Safety.UnderRoot(_destination, relative);
+                Safety.RejectReparse(target);
+                output = (_journal ?? throw new IOException("Archive receipt is missing.")).CreateFile(target, FileAccess.Write);
+            }
+            _current = new OutputStream(output, _token, _maximum, _budget); stream = _current; return Native.Ok;
+        }
+        catch (Exception ex) { Error = ex; return ex is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public int PrepareOperation(int askMode) => _token.IsCancellationRequested ? Native.Abort : Native.Ok;
+    public int SetOperationResult(int result)
+    {
+        try
+        {
+            _token.ThrowIfCancellationRequested();
+            if (_current?.Error is { } error) throw error;
+            if (result != 0) throw new WorkerException(result == 9 || PasswordRequested ? "wrong-password" : result == 1 ? "unsupported-method" : "corrupt-archive", result == 9 || PasswordRequested ? "密码错误或加密数据已损坏。" : "压缩包校验失败或数据不完整。", "请检查密码、补齐分卷，或重新取得完整压缩包。");
+            if (_current is not null && _entry?.Size is { } expected && _current.Bytes != expected) throw new WorkerException("corrupt-archive", "压缩包实际文件大小与声明不一致。");
+            CloseCurrent(); _completed++;
+            return Native.Ok;
+        }
+        catch (Exception ex) { Error = ex; CloseCurrent(); return ex is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public int CryptoGetTextPassword(out IntPtr password)
+    {
+        password = IntPtr.Zero; PasswordRequested = true;
+        if (_token.IsCancellationRequested || _password is null) return Native.Abort;
+        try { password = Marshal.StringToBSTR(_password); return Native.Ok; }
+        catch (Exception ex) { Error = ex; return Native.Fail; }
+    }
+    private void CloseCurrent() { if (_current?.Error is { } error) Error ??= error; _current?.Dispose(); _current = null; }
+    public void Dispose() => CloseCurrent();
+}
+
+[ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+public sealed class UpdateCallback : IArchiveUpdateCallback, IProgress, ICryptoGetTextPassword2, IDisposable
+{
+    private readonly IReadOnlyList<FrozenEntry> _entries;
+    private readonly string? _password;
+    private readonly CancellationToken _token;
+    private readonly List<InputStream> _streams = [];
+    private long _total;
+    private int _completed;
+    private string? _current;
+    internal Exception? Error { get; private set; }
+    internal UpdateCallback(IReadOnlyList<FrozenEntry> entries, string? password, CancellationToken token) { _entries = entries; _password = password; _token = token; }
+    public int SetTotal(ulong total) { _total = total <= long.MaxValue ? (long)total : 0; return _token.IsCancellationRequested ? Native.Abort : Native.Ok; }
+    public int SetCompleted(IntPtr completed)
+    {
+        if (_token.IsCancellationRequested) return Native.Abort;
+        long processed = completed == IntPtr.Zero ? 0 : Math.Max(0, Marshal.ReadInt64(completed));
+        Protocol.Progress(processed, _total, _completed, _entries.Count, _current, "compressing"); return Native.Ok;
+    }
+    public int GetUpdateItemInfo(uint index, out int newData, out int newProperties, out uint indexInArchive)
+    { newData = 1; newProperties = 1; indexInArchive = uint.MaxValue; return _token.IsCancellationRequested ? Native.Abort : Native.Ok; }
+    public int GetProperty(uint index, uint property, ref PropVariant value)
+    {
+        try
+        {
+            FrozenEntry entry = _entries[checked((int)index)];
+            value = (Property)property switch
+            {
+                Property.Path => PropVariant.Text(entry.Path.Replace('\\', '/')),
+                Property.IsDir => PropVariant.Flag(entry.IsDirectory),
+                Property.Size => PropVariant.U64((ulong)entry.Size),
+                Property.MTime => PropVariant.Time(entry.Modified),
+                Property.Attrib => PropVariant.U32(entry.IsDirectory ? 0x10u : 0x20u),
+                Property.PosixAttrib => PropVariant.U32(entry.IsDirectory ? 0x41EDu : 0x81A4u),
+                Property.IsAnti => PropVariant.Flag(false), _ => default
+            };
+            return _token.IsCancellationRequested ? Native.Abort : Native.Ok;
+        }
+        catch (Exception ex) { Error = ex; return Native.Fail; }
+    }
+    public int GetStream(uint index, out ISequentialInStream? stream)
+    {
+        stream = null;
+        try
+        {
+            _token.ThrowIfCancellationRequested(); FrozenEntry entry = _entries[checked((int)index)]; _current = entry.Path;
+            if (entry.IsDirectory) return Native.Ok;
+            var input = new InputStream(new DeferredReadStream(entry.SnapshotPath!), _token);
+            _streams.Add(input); stream = input; return Native.Ok;
+        }
+        catch (Exception ex) { Error = ex; return ex is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public int SetOperationResult(int result)
+    {
+        if (result != 0) { Error = new WorkerException("compression-failed", "部分文件未能压缩。"); return Native.Fail; }
+        _completed++; return _token.IsCancellationRequested ? Native.Abort : Native.Ok;
+    }
+    public int CryptoGetTextPassword2(out int defined, out IntPtr password)
+    {
+        defined = _password is null ? 0 : 1; password = IntPtr.Zero;
+        if (_token.IsCancellationRequested) return Native.Abort;
+        try { if (_password is not null) password = Marshal.StringToBSTR(_password); return Native.Ok; }
+        catch (Exception ex) { Error = ex; return Native.Fail; }
+    }
+    public void Dispose() { foreach (var stream in _streams) { Error ??= stream.Error; stream.Dispose(); } }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/CatFileAssistant.ArchiveWorker.csproj ---
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>CatFileAssistant.ArchiveWorker</AssemblyName>
+  </PropertyGroup>
+</Project>
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/NativeInterop.cs ---
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (c) 2026 CatFileAssistant contributors.
+// ABI declarations are based on the public 7-Zip 26.04 interface headers.
+using System.Runtime.InteropServices;
+
+namespace CatFileAssistant.ArchiveWorker;
+
+[StructLayout(LayoutKind.Explicit, Size = 24)]
+public struct PropVariant
+{
+    [FieldOffset(0)] public ushort Type;
+    [FieldOffset(2)] public ushort Reserved1;
+    [FieldOffset(4)] public ushort Reserved2;
+    [FieldOffset(6)] public ushort Reserved3;
+    [FieldOffset(8)] public ulong Unsigned;
+    [FieldOffset(8)] public long Signed;
+    [FieldOffset(8)] public uint UInt32;
+    [FieldOffset(8)] public short Boolean;
+    [FieldOffset(8)] public IntPtr Pointer;
+    public readonly string? String => Type == 8 ? Marshal.PtrToStringBSTR(Pointer) : null;
+    public readonly ulong? Number => Type switch { 19 => UInt32, 21 => Unsigned, 20 when Signed >= 0 => (ulong)Signed, _ => null };
+    public readonly bool IsTrue => Type == 11 && Boolean != 0;
+    public void Clear() { Native.PropVariantClear(ref this); this = default; }
+    public static PropVariant Text(string value) => new() { Type = 8, Pointer = Marshal.StringToBSTR(value) };
+    public static PropVariant Flag(bool value) => new() { Type = 11, Boolean = value ? (short)-1 : (short)0 };
+    public static PropVariant U32(uint value) => new() { Type = 19, UInt32 = value };
+    public static PropVariant U64(ulong value) => new() { Type = 21, Unsigned = value };
+    public static PropVariant Time(DateTime value) => new() { Type = 64, Signed = value.ToFileTimeUtc() };
+}
+
+internal static class Native
+{
+    internal const int Ok = 0, False = 1, Abort = unchecked((int)0x80004004), Fail = unchecked((int)0x80004005);
+    [DllImport("ole32.dll")] internal static extern int PropVariantClear(ref PropVariant value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int CreateObject(in Guid classId, in Guid interfaceId, out IntPtr result);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int GetNumberOfFormats(out uint count);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] internal delegate int GetHandlerProperty2(uint index, uint property, ref PropVariant value);
+    internal static void Check(int result, string message = "压缩引擎报告错误。")
+    {
+        if (result != Ok) throw new WorkerException(result == Abort ? "cancelled" : "engine-error", message);
+    }
+    internal static void Write32(IntPtr target, uint value) { if (target != IntPtr.Zero) Marshal.WriteInt32(target, unchecked((int)value)); }
+    internal static void Write64(IntPtr target, ulong value) { if (target != IntPtr.Zero) Marshal.WriteInt64(target, unchecked((long)value)); }
+}
+
+internal enum Property : uint
+{
+    Path = 3, Name = 4, IsDir = 6, Size = 7, PackSize = 8, Attrib = 9,
+    MTime = 12, Solid = 13, Encrypted = 15, Crc = 19, IsAnti = 21, Method = 22, Block = 27, Checksum = 46, Characts = 47, PosixAttrib = 53,
+    SymLink = 54, IsAltStream = 63, ErrorFlags = 71, NtReparse = 89, HardLink = 90
+}
+
+// Each interface declares its complete vtable after IUnknown. C# interface
+// inheritance is deliberately avoided for classic COM interoperability.
+[ComImport, Guid("23170F69-40C1-278A-0000-000600600000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IInArchive
+{
+    [PreserveSig] int Open([MarshalAs(UnmanagedType.Interface)] IInStream stream, IntPtr maxCheckStartPosition, [MarshalAs(UnmanagedType.Interface)] IArchiveOpenCallback callback);
+    [PreserveSig] int Close();
+    [PreserveSig] int GetNumberOfItems(out uint count);
+    [PreserveSig] int GetProperty(uint index, uint property, ref PropVariant value);
+    [PreserveSig] int Extract(IntPtr indices, uint count, int testMode, [MarshalAs(UnmanagedType.Interface)] IArchiveExtractCallback callback);
+    [PreserveSig] int GetArchiveProperty(uint property, ref PropVariant value);
+    [PreserveSig] int GetNumberOfProperties(out uint count);
+    [PreserveSig] int GetPropertyInfo(uint index, out IntPtr name, out uint property, out ushort variantType);
+    [PreserveSig] int GetNumberOfArchiveProperties(out uint count);
+    [PreserveSig] int GetArchivePropertyInfo(uint index, out IntPtr name, out uint property, out ushort variantType);
+}
+[ComImport, Guid("23170F69-40C1-278A-0000-000600700000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IArchiveGetRawProps
+{
+    [PreserveSig] int GetParent(uint index, out uint parent, out uint parentType);
+    [PreserveSig] int GetRawProp(uint index, uint property, out IntPtr data, out uint dataSize, out uint propertyType);
+    [PreserveSig] int GetNumRawProps(out uint count);
+    [PreserveSig] int GetRawPropInfo(uint index, out IntPtr name, out uint property);
+}
+[ComImport, Guid("23170F69-40C1-278A-0000-000600A00000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IOutArchive
+{
+    [PreserveSig] int UpdateItems([MarshalAs(UnmanagedType.Interface)] ISequentialOutStream stream, uint count, [MarshalAs(UnmanagedType.Interface)] IArchiveUpdateCallback callback);
+    [PreserveSig] int GetFileTimeType(out uint type);
+}
+[ComImport, Guid("23170F69-40C1-278A-0000-000600030000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface ISetProperties
+{
+    [PreserveSig] int SetProperties(IntPtr names, IntPtr values, uint count);
+}
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000300010000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface ISequentialInStream { [PreserveSig] int Read(IntPtr data, uint size, IntPtr processedSize); }
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000300030000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IInStream
+{
+    [PreserveSig] int Read(IntPtr data, uint size, IntPtr processedSize);
+    [PreserveSig] int Seek(long offset, uint origin, IntPtr newPosition);
+}
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000300020000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface ISequentialOutStream { [PreserveSig] int Write(IntPtr data, uint size, IntPtr processedSize); }
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000300040000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IOutStream
+{
+    [PreserveSig] int Write(IntPtr data, uint size, IntPtr processedSize);
+    [PreserveSig] int Seek(long offset, uint origin, IntPtr newPosition);
+    [PreserveSig] int SetSize(ulong size);
+}
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000000050000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IProgress
+{
+    [PreserveSig] int SetTotal(ulong total);
+    [PreserveSig] int SetCompleted(IntPtr completed);
+}
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000600100000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IArchiveOpenCallback
+{
+    [PreserveSig] int SetTotal(IntPtr files, IntPtr bytes);
+    [PreserveSig] int SetCompleted(IntPtr files, IntPtr bytes);
+}
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000600300000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IArchiveOpenVolumeCallback
+{
+    [PreserveSig] int GetProperty(uint property, ref PropVariant value);
+    [PreserveSig] int GetStream([MarshalAs(UnmanagedType.LPWStr)] string name, [MarshalAs(UnmanagedType.Interface)] out IInStream? stream);
+}
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000600200000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IArchiveExtractCallback
+{
+    [PreserveSig] int SetTotal(ulong total);
+    [PreserveSig] int SetCompleted(IntPtr completed);
+    [PreserveSig] int GetStream(uint index, [MarshalAs(UnmanagedType.Interface)] out ISequentialOutStream? stream, int askMode);
+    [PreserveSig] int PrepareOperation(int askMode);
+    [PreserveSig] int SetOperationResult(int result);
+}
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000600800000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IArchiveUpdateCallback
+{
+    [PreserveSig] int SetTotal(ulong total);
+    [PreserveSig] int SetCompleted(IntPtr completed);
+    [PreserveSig] int GetUpdateItemInfo(uint index, out int newData, out int newProperties, out uint indexInArchive);
+    [PreserveSig] int GetProperty(uint index, uint property, ref PropVariant value);
+    [PreserveSig] int GetStream(uint index, [MarshalAs(UnmanagedType.Interface)] out ISequentialInStream? stream);
+    [PreserveSig] int SetOperationResult(int result);
+}
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000500100000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface ICryptoGetTextPassword { [PreserveSig] int CryptoGetTextPassword(out IntPtr password); }
+[ComVisible(true), Guid("23170F69-40C1-278A-0000-000500110000"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface ICryptoGetTextPassword2 { [PreserveSig] int CryptoGetTextPassword2(out int defined, out IntPtr password); }
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/Program.cs ---
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (c) 2026 CatFileAssistant contributors.
+using System.Text;
+using System.Text.Json;
+
+namespace CatFileAssistant.ArchiveWorker;
+
+internal static class Program
+{
+    [MTAThread]
+    private static async Task<int> Main(string[] args)
+    {
+        Console.InputEncoding = new UTF8Encoding(false);
+        Console.OutputEncoding = new UTF8Encoding(false);
+        Request? request = null;
+        using var cancellation = new CancellationTokenSource();
+        try
+        {
+            if (args.Length != 1 || !args[0].StartsWith("--dll=", StringComparison.Ordinal))
+                throw new WorkerException("invalid-request", "未提供压缩引擎路径。");
+            string dllPath = args[0][6..];
+            if (!Path.IsPathFullyQualified(dllPath) || !File.Exists(dllPath))
+                throw new WorkerException("engine-missing", "未找到压缩引擎。", "请重新安装完整应用。");
+            string? line = await Console.In.ReadLineAsync();
+            if (line is null || line.Length > 1048576) throw new WorkerException("invalid-request", "无效的压缩任务请求。");
+            request = JsonSerializer.Deserialize<Request>(line, Protocol.Json) ?? throw new WorkerException("invalid-request", "无效的压缩任务请求。");
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    while (await Console.In.ReadLineAsync() is { } cancelLine)
+                    {
+                        if (cancelLine.Length > 4096) continue;
+                        using var doc = JsonDocument.Parse(cancelLine);
+                        if (doc.RootElement.TryGetProperty("action", out var action) && action.GetString() == "cancel") cancellation.Cancel();
+                    }
+                }
+                catch { /* The parent also terminates workers after a cancellation timeout. */ }
+            });
+            using var engine = new SevenZipEngine(dllPath, request, cancellation.Token);
+            Result result = engine.Run();
+            try { Protocol.Write(result); } catch (IOException) { /* A disconnected parent cannot receive another result. Keep the committed outcome. */ }
+            return result.Status is "completed" or "found" or "exhausted" ? 0 : result.Status == "cancelled" ? 2 : 1;
+        }
+        catch (Exception ex)
+        {
+            bool cancelled = cancellation.IsCancellationRequested || ex is OperationCanceledException;
+            WorkerError error = ex is WorkerException known ? new(known.Code, known.Message, known.Suggestion) : new("operation-failed", "压缩任务未能完成。", "请检查文件权限、磁盘剩余空间和压缩包完整性。");
+            Protocol.Write(new Result { Status = cancelled ? "cancelled" : "failed", OutputKind = request?.Action == "extract" || request?.SplitBytes is not null ? "directory" : "file", Format = request?.Format, Error = cancelled ? null : error });
+            return cancelled ? 2 : 1;
+        }
+    }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/Protocol.cs ---
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (c) 2026 CatFileAssistant contributors.
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace CatFileAssistant.ArchiveWorker;
+
+public sealed record Limits(long MaximumBytes = 107374182400, int MaximumEntries = 100000, int MaximumDepth = 64);
+public sealed record RecoveryOptions
+{
+    public int Digits { get; init; } = 4;
+    public string[]? Candidates { get; init; }
+    public int RangeCount { get; init; }
+    public int Lane { get; init; }
+    public int Lanes { get; init; } = 1;
+    public int? CpuFallbackPercent { get; init; }
+}
+public sealed record Request
+{
+    public string Action { get; init; } = "";
+    public string Id { get; init; } = "";
+    public string[] SourcePaths { get; init; } = [];
+    public string? SourcePath { get; init; }
+    public string OutputDirectory { get; init; } = "";
+    public string ArchiveName { get; init; } = "";
+    public string? WorkDirectory { get; init; }
+    public string? JournalPath { get; init; }
+    public string Format { get; init; } = "zip";
+    public int Level { get; init; } = 5;
+    public string? Password { get; init; }
+    public long? SplitBytes { get; init; }
+    public Limits Limits { get; init; } = new();
+    public RecoveryOptions? Recovery { get; init; }
+}
+public sealed record WorkerError(string Code, string Message, string Suggestion);
+public sealed record Result
+{
+    public string Type { get; init; } = "result";
+    public string Status { get; init; } = "failed";
+    public string? OutputPath { get; init; }
+    public string OutputKind { get; init; } = "file";
+    public long SourceBytes { get; init; }
+    public long OutputBytes { get; init; }
+    public int EntryCount { get; init; }
+    public string? Format { get; init; }
+    public bool RequiresPassword { get; init; }
+    public long CompletedCandidates { get; init; }
+    public string? RecoveredPassword { get; init; }
+    public bool PossiblePassword { get; init; }
+    public WorkerError? Error { get; init; }
+}
+public sealed class WorkerException(string code, string message, string suggestion = "请检查文件与输出位置后重试。") : Exception(message)
+{
+    public string Code { get; } = code;
+    public string Suggestion { get; } = suggestion;
+}
+internal static class Protocol
+{
+    internal static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = false, DefaultIgnoreCondition = JsonIgnoreCondition.Never };
+    private static readonly object Gate = new();
+    private static long _lastProgress;
+    internal static void Write(object value)
+    {
+        lock (Gate) { Console.Out.WriteLine(JsonSerializer.Serialize(value, Json)); Console.Out.Flush(); }
+    }
+    internal static void Progress(long processed, long? total, int entries, int? count, string? current, string stage, bool force = false)
+    {
+        long now = Environment.TickCount64;
+        lock (Gate)
+        {
+            if (!force && now - _lastProgress < 100) return;
+            _lastProgress = now;
+            Write(new { type = "progress", percent = total is > 0 ? Math.Min(100.0, 100.0 * processed / total.Value) : (double?)null, processedBytes = processed, totalBytes = total, processedEntries = entries, totalEntries = count, currentEntry = current, stage });
+        }
+    }
+    internal static void RecoveryProgress(long completedCandidates, string stage, bool possiblePassword, bool force = false)
+    {
+        long now = Environment.TickCount64;
+        lock (Gate)
+        {
+            if (!force && now - _lastProgress < 100) return;
+            _lastProgress = now;
+            Write(new { type = "recovery-progress", completedCandidates, stage, possiblePassword });
+        }
+    }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/README.md ---
+# Archive Worker
+
+This independent Windows x64 .NET 10 executable loads the unmodified, complete
+official 7-Zip `7z.dll` through its COM-style ABI. It does not load the native
+engine into the desktop UI process and does not invoke the 7-Zip CLI.
+
+Worker source is licensed under **LGPL-2.1-or-later**; each C# source file includes
+an SPDX identifier. Public ABI declarations follow the 7-Zip 26.04 interface
+headers. The application distribution includes this worker's corresponding
+source and the engine's corresponding source and license texts. The main
+application's license is independent. See the application's third-party notices.
+
+## Invocation and protocol
+
+The only argument is `--dll=<absolute path to 7z.dll>`. Standard input contains
+one UTF-8 JSON request line and optional subsequent `{"action":"cancel"}` lines.
+Standard output contains only camelCase JSON `progress` and terminal `result`
+lines, as defined in `Protocol.cs`. Passwords are sent in the request body, never
+on the command line, and are not included in errors or diagnostic output.
+
+`workDirectory` is an optional, parent-generated direct child of
+`outputDirectory` whose name starts with `.cat-archive-`. It must not already
+exist. Providing it lets the parent remove this exact task staging directory
+after terminating an unresponsive native decoder.
+
+## Supported operations
+
+Create ZIP, 7z, TAR and TAR.GZ with levels 0, 1, 5 and 9; TAR is an uncompressed
+container. ZIP uses Store or Deflate, with optional AES-256 encryption. The
+official ZIP encoder accepts only printable ASCII passwords of 1–99 characters;
+7z permits Unicode passwords of 1–1024 characters and encrypts headers when a
+password is supplied. Passwords may not contain NUL, CR or LF. TAR and TAR.GZ
+do not support passwords.
+
+Extract ZIP, 7z, RAR/RAR5, TAR, GZ, BZ2, XZ, TAR.GZ/TGZ, TAR.BZ2/TBZ/TBZ2 and
+TAR.XZ/TXZ. Native RAR and ZIP volumes are restricted to related filenames in
+the source archive's directory. Numbered `.001` inputs are concatenated from a
+contiguous series; missing or repeated volume numbers are rejected. Newly
+created 7z volumes are ordinary byte slices, minimum 1 MiB, after the complete
+single archive has passed native decoding. Their SHA-256 concatenation and full
+native decoding are checked before the entire volume directory is committed.
+
+Inspect reads archive headers, the item count and encrypted flags without
+applying user-adjustable extraction path/size/entry limits. Execute performs a
+complete preflight and refuses absolute/traversal/ADS/device paths, duplicate
+and colliding names, symbolic/hard links, reparse data, alternate streams,
+anti-items and special TAR file types. All output goes through controlled
+streams into fresh staging; native output bytes, including a TAR wrapper's
+intermediate bytes, are counted against the task budget. Archives embedded in
+extracted files are not recursively unpacked.
+
+Recover supports four- or six-digit ASCII numeric passwords for encrypted ZIP,
+7z and RAR/RAR5 archives. A `recover` request supplies `recovery` with `digits`,
+optional deduplicated `candidates`, or a numeric `rangeCount`, and zero-based
+`lane` / positive `lanes`. Each worker tests indices `lane + n * lanes` in one
+long-lived process. Public headers and their native handler remain open;
+encrypted headers reopen only their identified handler for each candidate.
+An encrypted non-empty entry with integrity checking is decoded first, then
+the full archive is decoded to controlled null output. No extracted files or
+recovered-password files are created. Empty or unverifiable encrypted archives
+are rejected. A candidate passing the first decode but failing full CRC/data
+checking sets `possiblePassword` and searching continues; engine, I/O, memory
+and unsupported-method failures stop the task. Recovery applies the same
+entry/path/size safety limits as extraction.
+The worker retains input-stream errors from the main file and native volume
+callbacks. If a requested volume is unavailable and a decode cannot complete,
+it reports `missing-volume`, including RAR handlers that return a generic
+CRC/data failure for an incomplete split entry.
+
+Recovery emits `recovery-progress` frames with lane-local
+`completedCandidates`, `stage` (`testing` or `verifying`) and
+`possiblePassword`. Terminal statuses are `found`, `exhausted`, `cancelled` or
+`failed`; only `found` includes `recoveredPassword`. The parent must deduplicate
+candidates before partitioning and aggregate completed counts without counting
+dispatched candidates. It must put the entire pool in one shared Job Object
+with an aggregate memory limit and CPU cap. Optional `cpuFallbackPercent`
+(1–100) enables cancellable cooperative duty-cycle throttling for environments
+without native CPU rate support; null or zero disables it. A synchronous native
+key derivation cannot be precisely throttled or interrupted, so fallback CPU
+usage is approximate and the parent must retain its forced-cancellation limit.
+
+Creation enumerates and copies regular files into frozen snapshots, rejects
+reparse ancestors, verifies source length/mtime before and after copying, and
+checks those source files again before committing. Sources never get deleted.
+Output names are automatically numbered on conflict and commits never overwrite
+existing files. Verification, cancellation or extraction errors discard staging.
+The parent must enforce a decoder memory limit, execution timeout and eventual
+process termination, and clean only its recorded task directory after a kill.
+
+## Build
+
+`dotnet build CatFileAssistant.ArchiveWorker.csproj -c Release`.
+The application release script publishes a self-contained win-x64 worker into
+the application's `worker/` directory with the engine and notices alongside the
+distribution. The binary path is `worker/CatFileAssistant.ArchiveWorker.exe`.
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/Recovery.cs ---
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (c) 2026 CatFileAssistant contributors.
+using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.InteropServices;
+
+namespace CatFileAssistant.ArchiveWorker;
+
+internal sealed partial class SevenZipEngine
+{
+    private long _recoveryCompleted;
+    private bool _possiblePassword;
+    private string _recoveryStage = "testing";
+
+    private Result Recover()
+    {
+        try { return RecoverCore(); }
+        catch (Exception exception)
+        {
+            bool cancelled = _token.IsCancellationRequested || exception is OperationCanceledException;
+            WorkerError? error = cancelled ? null : exception switch
+            {
+                WorkerException known => new(known.Code, known.Message, known.Suggestion),
+                OutOfMemoryException => new("recovery-memory-limit", "密码恢复所需内存超过安全限额。", "请选择更低的计算强度或更小的压缩包。"),
+                IOException or UnauthorizedAccessException => new("recovery-io", "读取压缩包时遇到了问题。", "请检查读取权限、文件占用和分卷完整性。"),
+                _ => new("recovery-engine", "密码恢复引擎未能完成任务。", "请检查压缩包完整性和压缩引擎。")
+            };
+            return RecoveryResult(cancelled ? "cancelled" : "failed", error: error);
+        }
+    }
+
+    private Result RecoverCore()
+    {
+        RecoveryOptions options = ValidateRecovery();
+        string source = FullSource();
+        _sourceBytes = SourceLength(source);
+        using NativeArchive opened = OpenRecoveryArchive(source);
+        IReadOnlyList<ArchiveEntry>? cachedEntries = opened.HeaderEncrypted ? null : ReadEntries(opened);
+        ArchiveEntry? cachedProbe = cachedEntries is null ? null : SelectRecoveryProbe(opened, cachedEntries);
+        int count = options.Candidates?.Length ?? options.RangeCount;
+        string numericFormat = options.Digits == 4 ? "D4" : "D6";
+        using var throttle = new RecoveryThrottle(options.CpuFallbackPercent ?? 0, _token, ReportRecovery);
+        ReportRecovery(true);
+
+        for (int candidateIndex = options.Lane; candidateIndex < count; candidateIndex += options.Lanes)
+        {
+            _token.ThrowIfCancellationRequested();
+            string password = options.Candidates is { } candidates ? candidates[candidateIndex]
+                : candidateIndex.ToString(numericFormat, CultureInfo.InvariantCulture);
+            IReadOnlyList<ArchiveEntry>? entries = cachedEntries;
+            ArchiveEntry? probe = cachedProbe;
+            bool headerAccepted = !opened.HeaderEncrypted || opened.Reopen(password, _token);
+            if (headerAccepted)
+            {
+                if (entries is null)
+                {
+                    entries = ReadEntries(opened);
+                    probe = SelectRecoveryProbe(opened, entries);
+                }
+                _entryCount = entries.Count;
+                if (TestRecoveryEntries(opened, [probe!], password))
+                {
+                    // A short ZIP verifier can collide; only a complete native decode of
+                    // the probe, followed by all archive entries, confirms the candidate.
+                    _recoveryStage = "verifying";
+                    ReportRecovery(true);
+                    bool verified = TestRecoveryEntries(opened, entries, password);
+                    _recoveryCompleted++;
+                    if (verified)
+                    {
+                        ReportRecovery(true);
+                        return RecoveryResult("found", password, format: opened.Format);
+                    }
+                    _possiblePassword = true;
+                    _recoveryStage = "testing";
+                    ReportRecovery(true);
+                    throttle.Wait();
+                    continue;
+                }
+            }
+            _recoveryCompleted++;
+            ReportRecovery();
+            throttle.Wait();
+        }
+        ReportRecovery(true);
+        return RecoveryResult("exhausted", format: opened.Format);
+    }
+
+    private RecoveryOptions ValidateRecovery()
+    {
+        RecoveryOptions options = _request.Recovery ?? throw new WorkerException("invalid-request", "缺少密码恢复设置。");
+        int maximum = options.Digits switch { 4 => 10000, 6 => 1000000, _ => 0 };
+        if (maximum == 0 || options.Lanes is < 1 or > 256 || options.Lane < 0 || options.Lane >= options.Lanes
+            || options.CpuFallbackPercent is < 0 or > 100)
+            throw new WorkerException("invalid-request", "密码恢复位数、分片或计算强度无效。");
+        if (options.Candidates is { } candidates)
+        {
+            if (candidates.Length > 100000 || candidates.Any(candidate => candidate is null
+                || candidate.Length != options.Digits || candidate.Any(character => !char.IsAsciiDigit(character)))
+                || candidates.Distinct(StringComparer.Ordinal).Count() != candidates.Length)
+                throw new WorkerException("invalid-request", "恢复候选须为去重后的指定长度纯数字密码。");
+        }
+        else if (options.RangeCount < 1 || options.RangeCount > maximum)
+            throw new WorkerException("invalid-request", "数字密码恢复范围无效。");
+        return options;
+    }
+
+    private NativeArchive OpenRecoveryArchive(string source)
+    {
+        string preferred = GuessFormat(source) switch { "rar" => "Rar5", var format => format };
+        string[] allowed = ["7z", "zip", "Rar5", "Rar"];
+        IEnumerable<string> formats = allowed.Contains(preferred, StringComparer.OrdinalIgnoreCase)
+            ? new[] { preferred }.Concat(allowed).Distinct(StringComparer.OrdinalIgnoreCase) : allowed;
+        foreach (string format in formats)
+        {
+            _token.ThrowIfCancellationRequested();
+            if (!_formats.TryGetValue(format, out Guid classId)) continue;
+            IInArchive archive = CreateNative<IInArchive>(classId);
+            var callback = new OpenCallback(source, null, _token);
+            InputStream? input = null;
+            bool retained = false;
+            try
+            {
+                // Parallelism belongs to the bounded process pool, not to nested
+                // decoder threads. Older RAR handlers need no thread properties.
+                if (archive is ISetProperties properties && format is "7z" or "zip" or "Rar5")
+                {
+                    var values = new List<(string, PropVariant)> { ("mt", PropVariant.U32(1)) };
+                    if (format == "7z") values.Add(("mtf", PropVariant.Flag(false)));
+                    SetProperties(properties, values);
+                }
+                input = new InputStream(OpenSource(source), _token);
+                IntPtr position = Marshal.AllocHGlobal(8);
+                int status;
+                try { Marshal.WriteInt64(position, 0); status = archive.Open(input, position, callback); }
+                finally { Marshal.FreeHGlobal(position); }
+                if (callback.Error is { } error) throw error;
+                if (input.Error is { } inputError) throw inputError;
+                _token.ThrowIfCancellationRequested();
+                // Missing password deliberately returns E_ABORT. A password callback
+                // identifies the encrypted handler, which must remain fixed thereafter.
+                if (status == Native.Ok || callback.PasswordRequested)
+                {
+                    RecoveryNativeStatus.CheckFatal(status);
+                    retained = true;
+                    return new NativeArchive(archive, input, callback, format, source, callback.PasswordRequested);
+                }
+                RecoveryNativeStatus.CheckFatal(status);
+            }
+            finally
+            {
+                if (!retained) { archive.Close(); Marshal.FinalReleaseComObject(archive); input?.Dispose(); callback.Dispose(); }
+            }
+        }
+        throw new WorkerException("recovery-unsupported-format", "密码恢复仅支持有效的 ZIP、7Z 和 RAR 压缩包。", "请检查压缩包格式、完整性和所有分卷。");
+    }
+
+    private ArchiveEntry SelectRecoveryProbe(NativeArchive opened, IReadOnlyList<ArchiveEntry> entries)
+    {
+        List<ArchiveEntry> encrypted = entries.Where(entry => entry.Encrypted && !entry.IsDirectory
+            && entry.Size is > 0 && HasRecoveryIntegrity(opened, entry)).ToList();
+        if (encrypted.Count == 0)
+        {
+            bool hasEncryption = opened.HeaderEncrypted || entries.Any(entry => entry.Encrypted);
+            throw new WorkerException(hasEncryption ? "recovery-unverifiable" : "recovery-not-encrypted",
+                hasEncryption ? "压缩包没有可完整验证的加密文件数据。" : "此压缩包没有密码加密。",
+                hasEncryption ? "空文件或缺少校验信息的压缩包无法可靠确认恢复密码。" : "此压缩包可以直接解压。");
+        }
+        // In a solid archive, a late small file can require decoding a large prefix.
+        bool solid = ArchiveFlag(opened, Property.Solid) || encrypted.Any(entry => ItemFlag(opened, entry.Index, Property.Solid));
+        return solid ? encrypted.OrderBy(entry => entry.Index).First()
+            : encrypted.OrderBy(entry => ItemNumber(opened, entry.Index, Property.PackSize) ?? ulong.MaxValue)
+                .ThenBy(entry => entry.Size).ThenBy(entry => entry.Index).First();
+    }
+
+    private static bool HasRecoveryIntegrity(NativeArchive opened, ArchiveEntry entry)
+    {
+        // WinZip AES AE-2 intentionally omits CRC but provides a full authentication MAC.
+        if (ItemNumber(opened, entry.Index, Property.Crc) is not null) return true;
+        if (opened.Format.Equals("zip", StringComparison.OrdinalIgnoreCase))
+        {
+            PropVariant value = default;
+            try { Native.Check(opened.Archive.GetProperty(entry.Index, (uint)Property.Method, ref value)); return value.String?.Contains("AES", StringComparison.OrdinalIgnoreCase) == true; }
+            finally { value.Clear(); }
+        }
+        if (!opened.Format.Equals("Rar5", StringComparison.OrdinalIgnoreCase)) return false;
+        // RAR5 deliberately hides encrypted CRC values from kpidCRC. Its
+        // characteristics expose the actual CRC-present flag instead. Without
+        // CRC or BLAKE2, a stored encrypted entry can decode random same-length
+        // bytes without any integrity error, so password checks alone are unsafe.
+        PropVariant characteristics = default;
+        try
+        {
+            Native.Check(opened.Archive.GetProperty(entry.Index, (uint)Property.Characts, ref characteristics));
+            if (characteristics.String?.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Contains("CRC", StringComparer.Ordinal) == true) return true;
+        }
+        finally { characteristics.Clear(); }
+        if (opened.Archive is not IArchiveGetRawProps rawProperties) return false;
+        Native.Check(rawProperties.GetRawProp(entry.Index, (uint)Property.Checksum,
+            out IntPtr hash, out uint hashSize, out uint propertyType));
+        // The native RAR5 handler exposes only a validated BLAKE2sp record here.
+        // Its borrowed buffer belongs to the handler; no copy or free is needed.
+        return hash != IntPtr.Zero && hashSize == 32 && propertyType == 1;
+    }
+
+    private bool TestRecoveryEntries(NativeArchive opened, IReadOnlyList<ArchiveEntry> entries, string password)
+    {
+        using var callback = new RecoveryExtractCallback(entries, password, _token,
+            _request.Limits.MaximumBytes, ReportRecovery);
+        uint[] indices = entries.Select(entry => entry.Index).Order().ToArray();
+        var pinned = GCHandle.Alloc(indices, GCHandleType.Pinned);
+        int status;
+        try { status = opened.Archive.Extract(pinned.AddrOfPinnedObject(), (uint)indices.Length, 0, callback); }
+        finally { pinned.Free(); }
+        if (callback.Error is { } error) throw error;
+        if (opened.ReadError is { } readError) throw readError;
+        _token.ThrowIfCancellationRequested();
+        RecoveryNativeStatus.CheckFatal(status);
+        if (callback.OperationResult is 1)
+            throw new WorkerException("unsupported-method", "压缩引擎不支持压缩包使用的算法。", "请使用支持此算法的压缩软件。");
+        // RAR handlers can expose a truncated split entry as a CRC/data error,
+        // rather than Unavailable. Preserve the volume callback evidence so
+        // missing pieces are never misreported as an exhausted password search.
+        if (callback.OperationResult is 4 || opened.MissingVolumeRequested
+            && (status != Native.Ok || callback.OperationResult != 0 || !callback.AllEntriesVerified))
+            throw new WorkerException("missing-volume", "压缩包数据或分卷不可用。", "请补齐全部分卷后重试。");
+        if (callback.OperationResult != 0) return false;
+        if (status != Native.Ok)
+            throw new WorkerException("recovery-engine", "压缩引擎没有完成密码验证。", "请检查压缩包完整性和引擎兼容性。");
+        if (!callback.AllEntriesVerified)
+            throw new WorkerException("recovery-unverifiable", "压缩引擎未完整验证所有请求的条目。", "请检查压缩包完整性。");
+        return true;
+    }
+
+    private void ReportRecovery() => ReportRecovery(false);
+    private void ReportRecovery(bool force) => Protocol.RecoveryProgress(_recoveryCompleted, _recoveryStage, _possiblePassword, force);
+    private Result RecoveryResult(string status, string? password = null, WorkerError? error = null, string? format = null)
+        => new() { Status = status, SourceBytes = _sourceBytes, EntryCount = _entryCount,
+            Format = format?.ToLowerInvariant() switch { "rar5" => "rar", var value => value }, RequiresPassword = true,
+            CompletedCandidates = _recoveryCompleted, RecoveredPassword = password, PossiblePassword = _possiblePassword, Error = error };
+
+    private static ulong? ItemNumber(NativeArchive opened, uint index, Property property)
+    {
+        PropVariant value = default;
+        try { Native.Check(opened.Archive.GetProperty(index, (uint)property, ref value)); return value.Number; }
+        finally { value.Clear(); }
+    }
+    private static bool ItemFlag(NativeArchive opened, uint index, Property property)
+    {
+        PropVariant value = default;
+        try { Native.Check(opened.Archive.GetProperty(index, (uint)property, ref value)); return value.IsTrue; }
+        finally { value.Clear(); }
+    }
+    private static bool ArchiveFlag(NativeArchive opened, Property property)
+    {
+        PropVariant value = default;
+        try { Native.Check(opened.Archive.GetArchiveProperty((uint)property, ref value)); return value.IsTrue; }
+        finally { value.Clear(); }
+    }
+}
+
+internal static class RecoveryNativeStatus
+{
+    internal static void CheckFatal(int status)
+    {
+        if (status == unchecked((int)0x8007000E))
+            throw new WorkerException("recovery-memory-limit", "密码恢复所需内存超过安全限额。", "请降低计算强度或使用内存更充足的计算机。");
+        if (status == unchecked((int)0x80004001))
+            throw new WorkerException("unsupported-method", "压缩引擎不支持此加密或压缩算法。", "请使用支持此算法的压缩软件。");
+    }
+}
+
+internal sealed class RecoveryThrottle(int percent, CancellationToken token, Action report) : IDisposable
+{
+    private readonly Stopwatch _elapsed = Stopwatch.StartNew();
+    private long _waited;
+    internal void Wait()
+    {
+        if (percent is <= 0 or >= 100) return;
+        long work = Math.Max(0, _elapsed.ElapsedMilliseconds - _waited);
+        long target = work * (100 - percent) / percent;
+        while (_waited < target)
+        {
+            token.ThrowIfCancellationRequested();
+            int wait = (int)Math.Min(100, target - _waited);
+            var started = _elapsed.ElapsedMilliseconds;
+            if (token.WaitHandle.WaitOne(wait)) token.ThrowIfCancellationRequested();
+            _waited += Math.Max(1, _elapsed.ElapsedMilliseconds - started);
+            report();
+        }
+    }
+    public void Dispose() => _elapsed.Stop();
+}
+
+[ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+public sealed class RecoveryExtractCallback : IArchiveExtractCallback, IProgress, ICryptoGetTextPassword, IDisposable
+{
+    private readonly IReadOnlyDictionary<uint, ArchiveEntry> _entries;
+    private readonly HashSet<uint> _verified = [];
+    private readonly string _password;
+    private readonly CancellationToken _token;
+    private readonly ByteBudget _budget;
+    private readonly long _maximum;
+    private readonly Action _report;
+    private OutputStream? _current;
+    private ArchiveEntry? _entry;
+    private Exception? _error;
+    internal Exception? Error => _error ?? _current?.Error;
+    internal int OperationResult { get; private set; }
+    internal bool AllEntriesVerified => _verified.Count == _entries.Count;
+    internal RecoveryExtractCallback(IReadOnlyList<ArchiveEntry> entries, string password,
+        CancellationToken token, long maximum, Action report)
+    { _entries = entries.ToDictionary(entry => entry.Index); _password = password; _token = token; _maximum = maximum; _budget = new(maximum, token); _report = report; }
+    public int SetTotal(ulong total) => _token.IsCancellationRequested ? Native.Abort : Native.Ok;
+    public int SetCompleted(IntPtr completed)
+    { if (_token.IsCancellationRequested) return Native.Abort; _report(); return Native.Ok; }
+    public int GetStream(uint index, out ISequentialOutStream? stream, int askMode)
+    {
+        stream = null;
+        try
+        {
+            _token.ThrowIfCancellationRequested(); CloseCurrent(); _entry = null;
+            if (askMode != 0) return Native.Ok;
+            if (!_entries.TryGetValue(index, out _entry)) throw new WorkerException("corrupt-archive", "压缩引擎请求了未校验的条目。");
+            if (_entry.IsDirectory) return Native.Ok;
+            _current = new OutputStream(Stream.Null, _token, _maximum, _budget); stream = _current;
+            return Native.Ok;
+        }
+        catch (Exception exception) { _error = exception; return exception is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public int PrepareOperation(int askMode) => _token.IsCancellationRequested ? Native.Abort : Native.Ok;
+    public int SetOperationResult(int result)
+    {
+        try
+        {
+            _token.ThrowIfCancellationRequested();
+            if (_current?.Error is { } error) throw error;
+            if (result != 0) { OperationResult = result; CloseCurrent(); return Native.Fail; }
+            if (_current is not null && _entry?.Size is { } expected && _current.Bytes != expected)
+            { OperationResult = 2; CloseCurrent(); return Native.Fail; }
+            if (_entry is not null && !_verified.Add(_entry.Index))
+                throw new WorkerException("recovery-unverifiable", "压缩引擎重复返回同一条目的验证结果。");
+            CloseCurrent(); return Native.Ok;
+        }
+        catch (Exception exception) { _error = exception; CloseCurrent(); return exception is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public int CryptoGetTextPassword(out IntPtr password)
+    {
+        password = IntPtr.Zero;
+        if (_token.IsCancellationRequested) return Native.Abort;
+        try { password = Marshal.StringToBSTR(_password); return Native.Ok; }
+        catch (Exception exception) { _error = exception; return Native.Fail; }
+    }
+    private void CloseCurrent() { if (_current?.Error is { } error) _error ??= error; _current?.Dispose(); _current = null; }
+    public void Dispose() => CloseCurrent();
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/Safety.cs ---
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (c) 2026 CatFileAssistant contributors.
+namespace CatFileAssistant.ArchiveWorker;
+
+internal sealed record ArchiveEntry(uint Index, string Path, bool IsDirectory, long? Size, DateTime? Modified, bool Encrypted);
+internal sealed record FrozenEntry(string Path, string? SnapshotPath, bool IsDirectory, long Size, DateTime Modified);
+
+internal static class Safety
+{
+    internal static string WithoutCurrentDirectoryPrefix(string value)
+    {
+        string normalized = value.Replace('/', '\\');
+        while (normalized.StartsWith(".\\", StringComparison.Ordinal)) normalized = normalized[2..];
+        return normalized;
+    }
+    internal static string RelativePath(string value, int maximumDepth)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length > 32700 || value.IndexOf('\0') >= 0) Unsafe("压缩包包含无效文件名。");
+        string normalized = WithoutCurrentDirectoryPrefix(value);
+        if (Path.IsPathRooted(normalized) || normalized.StartsWith('\\')) Unsafe("压缩包包含绝对路径。");
+        var segments = normalized.Split('\\');
+        if (segments.Length > maximumDepth) throw new WorkerException("depth-limit", "文件层级超过安全限额。");
+        foreach (string part in segments)
+        {
+            if (part.Length == 0 || part is "." or ".." || part.Length > 255 || part.EndsWith('.') || part.EndsWith(' ') || part.Any(c => c < 32 || "<>:\"|?*".Contains(c))) Unsafe("压缩包包含不安全的文件路径。");
+            string stem = part.Split('.')[0].TrimEnd(' ', '.').ToUpperInvariant();
+            if (stem is "CON" or "PRN" or "AUX" or "NUL" or "CLOCK$" ||
+                stem.Length == 4 && (stem.StartsWith("COM") || stem.StartsWith("LPT")) && "123456789¹²³".Contains(stem[3])) Unsafe("压缩包包含系统保留文件名。");
+        }
+        return string.Join('\\', segments);
+    }
+    internal static string UnderRoot(string root, string relative)
+    {
+        string prefix = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) + Path.DirectorySeparatorChar;
+        string result = Path.GetFullPath(Path.Combine(prefix, relative));
+        if (!result.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) Unsafe("压缩包路径超出目标文件夹。");
+        return result;
+    }
+    internal static void RejectReparse(string path)
+    {
+        string? current = Path.GetFullPath(path);
+        while (current is not null)
+        {
+            if (File.Exists(current) || Directory.Exists(current))
+            {
+                FileAttributes attributes = File.GetAttributes(current);
+                if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Device)) != 0) Unsafe("任务不支持符号链接、目录联接或设备文件。");
+            }
+            string? parent = Path.GetDirectoryName(current); if (parent == current) break; current = parent;
+        }
+    }
+    internal static void CheckEntryMap(IReadOnlyList<ArchiveEntry> entries)
+    {
+        var map = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in entries)
+            if (!map.TryAdd(entry.Path, entry.IsDirectory)) Unsafe("压缩包中有重复或大小写冲突的路径。");
+        foreach (var entry in entries)
+        {
+            string? parent = Path.GetDirectoryName(entry.Path);
+            while (!string.IsNullOrEmpty(parent))
+            {
+                if (map.TryGetValue(parent, out bool directory) && !directory) Unsafe("压缩包中文件与目录路径冲突。");
+                parent = Path.GetDirectoryName(parent);
+            }
+        }
+    }
+    internal static void Unsafe(string message) => throw new WorkerException("unsafe-entry", message, "此压缩包包含不安全的条目，请使用可信来源的压缩包。");
+    internal static string UniqueRoot(string name, HashSet<string> roots)
+    {
+        if (roots.Add(name)) return name;
+        string stem = Path.GetFileNameWithoutExtension(name), extension = Path.GetExtension(name);
+        for (int i = 2; ; i++) { string candidate = $"{stem} ({i}){extension}"; if (roots.Add(candidate)) return candidate; }
+    }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/SevenZipEngine.cs ---
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (c) 2026 CatFileAssistant contributors.
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using CatFileAssistant.Ownership;
+
+namespace CatFileAssistant.ArchiveWorker;
+
+internal sealed partial class SevenZipEngine : IDisposable
+{
+    private readonly Request _request;
+    private readonly CancellationToken _token;
+    private readonly IntPtr _library;
+    private readonly Native.CreateObject _create;
+    private readonly Dictionary<string, Guid> _formats = new(StringComparer.OrdinalIgnoreCase);
+    private string? _work;
+    private ArchiveTemporaryJournal? _journal;
+    private long _sourceBytes;
+    private int _entryCount;
+
+    internal SevenZipEngine(string dllPath, Request request, CancellationToken token)
+    {
+        _request = request; _token = token;
+        if (!Environment.Is64BitProcess || Marshal.SizeOf<PropVariant>() != 24) throw new WorkerException("engine-platform", "压缩引擎需要 64 位 Windows。");
+        _library = NativeLibrary.Load(Path.GetFullPath(dllPath));
+        _create = Marshal.GetDelegateForFunctionPointer<Native.CreateObject>(NativeLibrary.GetExport(_library, "CreateObject"));
+        var count = Marshal.GetDelegateForFunctionPointer<Native.GetNumberOfFormats>(NativeLibrary.GetExport(_library, "GetNumberOfFormats"));
+        var property = Marshal.GetDelegateForFunctionPointer<Native.GetHandlerProperty2>(NativeLibrary.GetExport(_library, "GetHandlerProperty2"));
+        Native.Check(count(out uint formats));
+        for (uint i = 0; i < formats; i++)
+        {
+            PropVariant name = default, id = default;
+            try
+            {
+                Native.Check(property(i, 0, ref name)); Native.Check(property(i, 1, ref id));
+                if (name.String is { } format && id.Type == 8 && id.Pointer != IntPtr.Zero)
+                {
+                    byte[] bytes = new byte[16]; Marshal.Copy(id.Pointer, bytes, 0, bytes.Length); _formats[format] = new Guid(bytes);
+                }
+            }
+            finally { name.Clear(); id.Clear(); }
+        }
+        if (!_formats.ContainsKey("7z") || !_formats.ContainsKey("zip") || !_formats.ContainsKey("Rar5"))
+            throw new WorkerException("engine-incomplete", "压缩引擎不完整。", "请重新安装附带完整 7-Zip 引擎的应用。");
+    }
+
+    internal Result Run()
+    {
+        ValidateRequest();
+        _token.ThrowIfCancellationRequested();
+        return _request.Action switch { "create" => Create(), "extract" => Extract(), "inspect" => Inspect(), "recover" => Recover(), _ => throw new WorkerException("invalid-request", "不支持的压缩任务类型。") };
+    }
+    private void ValidateRequest()
+    {
+        if (_request.Limits.MaximumBytes <= 0 || _request.Limits.MaximumBytes > 1099511627776 || _request.Limits.MaximumEntries is < 1 or > 1000000 || _request.Limits.MaximumDepth is < 1 or > 256)
+            throw new WorkerException("invalid-request", "无效的压缩安全限额。");
+        if (_request.Password is { } password && (password.Length is 0 or > 1024 || password.Any(c => c is '\0' or '\r' or '\n')))
+            throw new WorkerException("invalid-password", "密码不能为空、超过 1024 个字符或包含换行及空字符。");
+        if (_request.Action == "create")
+        {
+            if (_request.Format is not ("zip" or "7z" or "tar" or "tar.gz") || _request.Level is not (0 or 1 or 5 or 9)) throw new WorkerException("invalid-request", "不支持的压缩格式或档位。");
+            if (_request.Password is not null && _request.Format is not ("zip" or "7z")) throw new WorkerException("invalid-options", "TAR 和 TAR.GZ 不支持密码加密。");
+            if (_request.Format == "zip" && _request.Password is { } zipPassword && (zipPassword.Length > 99 || zipPassword.Any(c => c < 32 || c > 126)))
+                throw new WorkerException("invalid-password", "ZIP 密码须为 1 至 99 个可打印 ASCII 字符。", "请使用英文字母、数字和英文符号；Unicode 密码可选择 7z 格式。");
+            if (_request.SplitBytes is { } split && (_request.Format != "7z" || split < 1048576 || split > _request.Limits.MaximumBytes)) throw new WorkerException("invalid-options", "只有 7z 支持分卷，分卷大小须至少为 1 MiB。");
+            if (_request.SourcePaths.Length == 0) throw new WorkerException("invalid-request", "请至少选择一个文件或文件夹。");
+        }
+        else if (string.IsNullOrWhiteSpace(_request.SourcePath)) throw new WorkerException("invalid-request", "未选择压缩包。");
+        if (_request.Action is not ("inspect" or "recover"))
+        {
+            if (!Path.IsPathFullyQualified(_request.OutputDirectory)) throw new WorkerException("invalid-request", "输出文件夹必须为绝对路径。");
+            Safety.RejectReparse(_request.OutputDirectory);
+        }
+    }
+
+    private Result Create()
+    {
+        List<FrozenEntry> sourcePlan = EnumerateSources();
+        _entryCount = sourcePlan.Count; _sourceBytes = sourcePlan.Sum(x => x.Size);
+        string name = Safety.RelativePath(string.IsNullOrWhiteSpace(_request.ArchiveName) ? "压缩包" : _request.ArchiveName, 1);
+        string extension = "." + _request.Format;
+        if (!name.EndsWith(extension, StringComparison.OrdinalIgnoreCase)) name += extension;
+        string finalPath = Path.Combine(Path.GetFullPath(_request.OutputDirectory), _request.SplitBytes is null ? name : name + ".分卷");
+        PrepareWork(_request.OutputDirectory);
+        string snapshots = Path.Combine(_work!, "snapshots"); _journal!.CreateDirectory(snapshots);
+        List<FrozenEntry> frozen = Freeze(sourcePlan, snapshots);
+        string archivePath = Path.Combine(_work!, name);
+        if (_request.Format == "tar.gz")
+        {
+            string tarPath = Path.Combine(_work!, "payload.tar");
+            WriteArchive("tar", tarPath, frozen, null);
+            WriteArchive("gzip", archivePath, [new FrozenEntry(Path.GetFileNameWithoutExtension(name), tarPath, false, new FileInfo(tarPath).Length, DateTime.UtcNow)], null);
+        }
+        else WriteArchive(_request.Format, archivePath, frozen, _request.Password);
+        Verify(archivePath, _request.Password, _request.Format == "tar.gz");
+        ValidateOriginal(sourcePlan);
+        _token.ThrowIfCancellationRequested();
+        long outputBytes = new FileInfo(archivePath).Length;
+        if (_request.SplitBytes is { } split)
+        {
+            string volumes = Path.Combine(_work!, "volumes"); _journal!.CreateDirectory(volumes);
+            List<string> parts = Split(archivePath, volumes, name, split);
+            using (var original = File.OpenRead(archivePath))
+            using (var combined = new ConcatenatedStream(parts))
+            {
+                byte[] originalHash = ComputeHash(original), combinedHash = ComputeHash(combined);
+                if (!CryptographicOperations.FixedTimeEquals(originalHash, combinedHash)) throw new WorkerException("verification-failed", "分卷重组校验失败。");
+            }
+            Verify(parts[0], _request.Password, false);
+            ValidateOriginal(sourcePlan); _token.ThrowIfCancellationRequested(); finalPath = Commit(volumes, finalPath, true);
+        }
+        else
+        {
+            finalPath = Commit(archivePath, finalPath, false);
+        }
+        try { Protocol.Progress(outputBytes, outputBytes, _entryCount, _entryCount, null, "completed", true); } catch (IOException) { }
+        return Success(finalPath, _request.SplitBytes is null ? "file" : "directory", outputBytes, _request.Format, _request.Password is not null);
+    }
+
+    private List<FrozenEntry> EnumerateSources()
+    {
+        var result = new List<FrozenEntry>(); var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase); long bytes = 0;
+        foreach (string input in _request.SourcePaths)
+        {
+            _token.ThrowIfCancellationRequested();
+            if (!Path.IsPathFullyQualified(input)) throw new WorkerException("invalid-request", "源文件必须为绝对路径。");
+            string full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(input)); Safety.RejectReparse(full);
+            if (!File.Exists(full) && !Directory.Exists(full)) throw new WorkerException("source-missing", "选中的源文件已不存在。");
+            string root = Safety.UniqueRoot(Safety.RelativePath(Path.GetFileName(full), 1), roots);
+            Add(full, root);
+        }
+        return result;
+        void Add(string physical, string relative)
+        {
+            _token.ThrowIfCancellationRequested(); Safety.RejectReparse(physical); relative = Safety.RelativePath(relative, _request.Limits.MaximumDepth);
+            bool directory = Directory.Exists(physical); long size = directory ? 0 : new FileInfo(physical).Length;
+            bytes = checked(bytes + size);
+            if (bytes > _request.Limits.MaximumBytes) throw new WorkerException("size-limit", "源文件总大小超过安全限额。");
+            if (result.Count >= _request.Limits.MaximumEntries) throw new WorkerException("entry-limit", "源文件条目数超过安全限额。");
+            result.Add(new(relative, directory ? null : physical, directory, size, directory ? Directory.GetLastWriteTimeUtc(physical) : File.GetLastWriteTimeUtc(physical)));
+            if (directory)
+                foreach (string child in Directory.EnumerateFileSystemEntries(physical).Order(StringComparer.OrdinalIgnoreCase)) Add(child, relative + "\\" + Path.GetFileName(child));
+        }
+    }
+
+    private List<FrozenEntry> Freeze(IReadOnlyList<FrozenEntry> plan, string directory)
+    {
+        var frozen = new List<FrozenEntry>(plan.Count); long processed = 0; int entries = 0;
+        foreach (FrozenEntry entry in plan)
+        {
+            _token.ThrowIfCancellationRequested();
+            if (entry.IsDirectory) { frozen.Add(entry); entries++; continue; }
+            string source = entry.SnapshotPath!, target = Path.Combine(directory, entries.ToString("D8") + ".bin"); Safety.RejectReparse(source);
+            using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var output = _journal!.CreateFile(target, FileAccess.Write))
+            {
+                if (input.Length != entry.Size || File.GetLastWriteTimeUtc(source) != entry.Modified) throw new WorkerException("source-changed", "源文件在开始压缩前发生变化。", "请等待其他程序保存完成后重试。");
+                Copy(input, output, entry.Size, bytes => { processed += bytes; Protocol.Progress(processed, _sourceBytes, entries, plan.Count, entry.Path, "snapshot"); });
+                if (input.Length != entry.Size || File.GetLastWriteTimeUtc(source) != entry.Modified) throw new WorkerException("source-changed", "源文件在建立快照时发生变化。", "请等待其他程序保存完成后重试。");
+            }
+            frozen.Add(entry with { SnapshotPath = target }); entries++;
+        }
+        return frozen;
+    }
+    private void ValidateOriginal(IReadOnlyList<FrozenEntry> plan)
+    {
+        foreach (FrozenEntry entry in plan)
+        {
+            _token.ThrowIfCancellationRequested();
+            if (entry.IsDirectory) continue;
+            string path = entry.SnapshotPath!; Safety.RejectReparse(path);
+            if (!File.Exists(path) || new FileInfo(path).Length != entry.Size || File.GetLastWriteTimeUtc(path) != entry.Modified)
+                throw new WorkerException("source-changed", "源文件在任务期间发生变化。", "请等待其他程序保存完成后重试。");
+        }
+    }
+
+    private Result Inspect()
+    {
+        string source = FullSource(); _sourceBytes = SourceLength(source);
+        using NativeArchive? opened = TryOpen(source, _request.Password, out bool needed);
+        if (opened is null && needed && _request.Password is null) return Success(null, "file", 0, GuessFormat(source), true);
+        if (opened is null) CannotOpen(needed);
+        // Import only identifies headers. Execute performs the full current-limit
+        // path/type/size preflight, so increasing user limits still permits import.
+        Native.Check(opened!.Archive.GetNumberOfItems(out uint count));
+        _entryCount = count > int.MaxValue ? int.MaxValue : (int)count;
+        bool passwordRequired = needed;
+        for (uint i = 0; !passwordRequired && i < count; i++)
+        {
+            _token.ThrowIfCancellationRequested(); PropVariant encrypted = default;
+            try { Native.Check(opened.Archive.GetProperty(i, (uint)Property.Encrypted, ref encrypted)); passwordRequired = encrypted.IsTrue; }
+            finally { encrypted.Clear(); }
+        }
+        return Success(null, "file", 0, DisplayFormat(opened.Format, source), passwordRequired);
+    }
+
+    private Result Extract()
+    {
+        string source = FullSource(); _sourceBytes = SourceLength(source);
+        string name = Safety.RelativePath(string.IsNullOrWhiteSpace(_request.ArchiveName) ? StripExtension(Path.GetFileName(source)) : _request.ArchiveName, 1);
+        string finalPath = Path.Combine(Path.GetFullPath(_request.OutputDirectory), name);
+        PrepareWork(_request.OutputDirectory); string content = Path.Combine(_work!, "content"); _journal!.CreateDirectory(content);
+        var budget = new ByteBudget(_request.Limits.MaximumBytes, _token);
+        using NativeArchive? outer = TryOpen(source, _request.Password, out bool needed);
+        if (outer is null) CannotOpen(needed);
+        var entries = ReadEntries(outer!);
+        bool wrapped = IsTarWrapper(source);
+        string format = DisplayFormat(outer!.Format, source);
+        bool encrypted = needed || entries.Any(x => x.Encrypted);
+        if (wrapped)
+        {
+            if (outer.Format is not ("gzip" or "bzip2" or "xz") || entries.Count != 1 || entries[0].IsDirectory) throw new WorkerException("invalid-archive", "压缩包不是有效的 TAR 包装格式。");
+            string intermediate = Path.Combine(_work!, "intermediate"); _journal!.CreateDirectory(intermediate);
+            DoExtract(outer, entries, intermediate, budget, "decompressing", new() { [0] = "payload.tar" });
+            using NativeArchive? tar = TryOpen(Path.Combine(intermediate, "payload.tar"), null, out _);
+            if (tar is null || !tar.Format.Equals("tar", StringComparison.OrdinalIgnoreCase)) throw new WorkerException("invalid-archive", "包装层不包含有效的 TAR 压缩包。");
+            entries = ReadEntries(tar); DoExtract(tar, entries, content, budget, "extracting");
+        }
+        else DoExtract(outer, entries, content, budget, "extracting");
+        _entryCount = entries.Count;
+        long outputBytes = Directory.EnumerateFiles(content, "*", SearchOption.AllDirectories).Sum(x => new FileInfo(x).Length);
+        _token.ThrowIfCancellationRequested(); finalPath = Commit(content, finalPath, true);
+        try { Protocol.Progress(outputBytes, outputBytes, _entryCount, _entryCount, null, "completed", true); } catch (IOException) { }
+        return Success(finalPath, "directory", outputBytes, format, encrypted);
+    }
+
+    private void Verify(string source, string? password, bool tarWrapper)
+    {
+        using NativeArchive? opened = TryOpen(source, password, out bool needed); if (opened is null) CannotOpen(needed);
+        var entries = ReadEntries(opened!); var budget = new ByteBudget(_request.Limits.MaximumBytes, _token);
+        if (tarWrapper)
+        {
+            string folder = Path.Combine(_work!, "verify-" + Guid.NewGuid().ToString("N")); _journal!.CreateDirectory(folder);
+            DoExtract(opened!, entries, folder, budget, "verifying", new() { [0] = "payload.tar" });
+            using NativeArchive? tar = TryOpen(Path.Combine(folder, "payload.tar"), null, out _);
+            if (tar is null || !tar.Format.Equals("tar", StringComparison.OrdinalIgnoreCase)) throw new WorkerException("verification-failed", "TAR.GZ 校验失败。");
+            var inner = ReadEntries(tar); DoExtract(tar, inner, null, budget, "verifying");
+        }
+        else DoExtract(opened!, entries, null, budget, "verifying");
+    }
+
+    private void DoExtract(NativeArchive archive, IReadOnlyList<ArchiveEntry> entries, string? destination, ByteBudget budget, string stage, Dictionary<uint, string>? overrides = null)
+    {
+        using var callback = new ExtractCallback(entries, destination, _request.Password, _token, budget, _request.Limits.MaximumBytes, stage, overrides, _journal);
+        if (entries.Count == 0) return;
+        uint[] indices = entries.Select(entry => entry.Index).Order().ToArray();
+        var pinned = GCHandle.Alloc(indices, GCHandleType.Pinned);
+        int status;
+        try { status = archive.Archive.Extract(pinned.AddrOfPinnedObject(), (uint)indices.Length, 0, callback); }
+        finally { pinned.Free(); }
+        if (callback.Error is { } error) throw error;
+        _token.ThrowIfCancellationRequested();
+        if (status != Native.Ok)
+        {
+            if (callback.PasswordRequested && _request.Password is null) throw new WorkerException("password-required", "此压缩包需要密码。", "请输入压缩包密码后重试。");
+            throw new WorkerException(callback.PasswordRequested ? "wrong-password" : "corrupt-archive", callback.PasswordRequested ? "密码错误或加密数据已损坏。" : "压缩包解压或校验失败。", "请检查密码和压缩包完整性，并确保分卷齐全。");
+        }
+    }
+
+    private List<ArchiveEntry> ReadEntries(NativeArchive opened)
+    {
+        Native.Check(opened.Archive.GetNumberOfItems(out uint count));
+        if (count > _request.Limits.MaximumEntries) throw new WorkerException("entry-limit", "压缩包条目数超过安全限额。");
+        var entries = new List<ArchiveEntry>((int)count); long total = 0;
+        for (uint i = 0; i < count; i++)
+        {
+            _token.ThrowIfCancellationRequested();
+            string? rawPath = Text(i, Property.Path) ?? Text(i, Property.Name);
+            if (string.IsNullOrEmpty(rawPath) && opened.Format is "gzip" or "bzip2" or "xz") rawPath = StripExtension(Path.GetFileName(opened.SourcePath));
+            bool directory = Flag(i, Property.IsDir);
+            ulong? sizeValue = Number(i, Property.Size); long? size = sizeValue is null ? null : sizeValue <= long.MaxValue ? (long)sizeValue : throw new WorkerException("size-limit", "条目大小超过安全限额。");
+            // GZIP's footer ISIZE is modulo 2^32 and can describe only the last
+            // member. Treat it as unknown; the native decoder checks every CRC
+            // while controlled output streams enforce the actual byte budget.
+            if (opened.Format.Equals("gzip", StringComparison.OrdinalIgnoreCase)) size = null;
+            if (size is { } known) { total = checked(total + known); if (total > _request.Limits.MaximumBytes) throw new WorkerException("size-limit", "声明的解压大小超过安全限额。"); }
+            uint attributes = (uint)(Number(i, Property.Attrib) ?? 0), mode = (uint)(Number(i, Property.PosixAttrib) ?? 0);
+            if (mode == 0 && ((attributes & 0x8000) != 0 || (attributes & 0xF0000000) != 0)) mode = attributes >> 16;
+            uint type = mode & 0xF000;
+            if (type is not (0 or 0x4000 or 0x8000) || (attributes & 0x440) != 0 || Flag(i, Property.IsAltStream) || Flag(i, Property.IsAnti) ||
+                HasProperty(i, Property.SymLink) || HasProperty(i, Property.HardLink) || HasProperty(i, Property.NtReparse)) Safety.Unsafe("压缩包包含链接、设备、备用数据流或删除条目。");
+            if (opened.Format.Equals("tar", StringComparison.OrdinalIgnoreCase))
+            {
+                string? characteristics = Text(i, Property.Characts);
+                string? typeFlag = characteristics?.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+                if (typeFlag is not ("0" or "[00]" or "5" or "7" or "S")) Safety.Unsafe("TAR 压缩包包含链接或不支持的特殊条目。");
+            }
+            // GNU tar commonly includes a harmless '.' directory entry and
+            // './' prefixes. Validate its type first, then omit only that root
+            // directory; normalized child paths still reject traversal/aliases.
+            if (directory && opened.Format.Equals("tar", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrEmpty(rawPath) && Safety.WithoutCurrentDirectoryPrefix(rawPath) is "" or ".") continue;
+            string path = Safety.RelativePath(rawPath ?? "", _request.Limits.MaximumDepth);
+            DateTime? modified = null;
+            PropVariant timestamp = Get(i, Property.MTime);
+            try { if (timestamp.Type == 64) { try { modified = DateTime.FromFileTimeUtc(timestamp.Signed); } catch (ArgumentOutOfRangeException) { } } } finally { timestamp.Clear(); }
+            entries.Add(new(i, path, directory, directory ? 0 : size, modified, Flag(i, Property.Encrypted)));
+        }
+        Safety.CheckEntryMap(entries); return entries;
+        PropVariant Get(uint i, Property property) { PropVariant value = default; Native.Check(opened.Archive.GetProperty(i, (uint)property, ref value)); return value; }
+        string? Text(uint i, Property property) { PropVariant value = Get(i, property); try { return value.String; } finally { value.Clear(); } }
+        ulong? Number(uint i, Property property) { PropVariant value = Get(i, property); try { return value.Number; } finally { value.Clear(); } }
+        bool Flag(uint i, Property property) { PropVariant value = Get(i, property); try { return value.IsTrue; } finally { value.Clear(); } }
+        bool HasProperty(uint i, Property property) { PropVariant value = Get(i, property); try { return value.Type != 0 && !(value.Type == 8 && string.IsNullOrEmpty(value.String)); } finally { value.Clear(); } }
+    }
+
+    private NativeArchive? TryOpen(string source, string? password, out bool passwordNeeded)
+    {
+        passwordNeeded = false;
+        string guessed = GuessFormat(source), preferred = guessed.StartsWith("tar.", StringComparison.Ordinal) ? guessed[4..] switch { "gz" => "gzip", "bz2" => "bzip2", "xz" => "xz", _ => "tar" } : guessed switch { "gz" => "gzip", "bz2" => "bzip2", "rar" => "Rar5", _ => guessed };
+        string[] allowed = ["7z", "zip", "Rar5", "Rar", "gzip", "bzip2", "xz", "tar"];
+        foreach (string format in new[] { preferred }.Concat(allowed).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            _token.ThrowIfCancellationRequested(); if (!_formats.TryGetValue(format, out Guid classId)) continue;
+            IInArchive archive = CreateNative<IInArchive>(classId);
+            var callback = new OpenCallback(source, password, _token); InputStream? input = null;
+            try
+            {
+                input = new InputStream(OpenSource(source), _token);
+                IntPtr position = Marshal.AllocHGlobal(8);
+                int status; try { Marshal.WriteInt64(position, 0); status = archive.Open(input, position, callback); } finally { Marshal.FreeHGlobal(position); }
+                passwordNeeded |= callback.PasswordRequested;
+                if (callback.Error is { } error) throw error;
+                if (input.Error is { } inputError) throw inputError;
+                if (status == Native.Ok) return new NativeArchive(archive, input, callback, format, source);
+                if (callback.PasswordRequested) { archive.Close(); Marshal.FinalReleaseComObject(archive); input.Dispose(); callback.Dispose(); return null; }
+            }
+            catch { archive.Close(); Marshal.FinalReleaseComObject(archive); input?.Dispose(); callback.Dispose(); throw; }
+            archive.Close(); Marshal.FinalReleaseComObject(archive); input?.Dispose(); callback.Dispose();
+        }
+        return null;
+    }
+
+    private T CreateNative<T>(Guid classId) where T : class
+    {
+        Guid iid = typeof(T).GUID; Native.Check(_create(in classId, in iid, out IntPtr pointer), "无法初始化压缩格式。");
+        try { return (T)Marshal.GetObjectForIUnknown(pointer); } finally { Marshal.Release(pointer); }
+    }
+    private void WriteArchive(string format, string outputPath, IReadOnlyList<FrozenEntry> entries, string? password)
+    {
+        if (!_formats.TryGetValue(format, out Guid classId)) throw new WorkerException("unsupported-format", "压缩引擎不支持此格式。");
+        IOutArchive archive = CreateNative<IOutArchive>(classId);
+        try
+        {
+            var properties = new List<(string, PropVariant)>();
+            if (format != "tar") properties.Add(("x", PropVariant.U32((uint)_request.Level)));
+            if (format == "7z") { properties.Add(("0", PropVariant.Text(_request.Level == 0 ? "Copy" : "LZMA2"))); if (password is not null) properties.Add(("he", PropVariant.Flag(true))); }
+            if (format == "zip") { properties.Add(("m", PropVariant.Text(_request.Level == 0 ? "Copy" : "Deflate"))); properties.Add(("cu", PropVariant.Flag(true))); if (password is not null) properties.Add(("em", PropVariant.Text("AES256"))); }
+            if (properties.Count != 0) SetProperties((ISetProperties)archive, properties);
+            using var callback = new UpdateCallback(entries, password, _token);
+            using var stream = new OutputStream(_journal!.CreateFile(outputPath, FileAccess.ReadWrite), _token, _request.Limits.MaximumBytes);
+            int status = archive.UpdateItems(stream, (uint)entries.Count, callback);
+            if (callback.Error is { } error) throw error; if (stream.Error is { } streamError) throw streamError;
+            _token.ThrowIfCancellationRequested(); Native.Check(status, "压缩任务失败。");
+        }
+        finally { Marshal.FinalReleaseComObject(archive); }
+    }
+    private static void SetProperties(ISetProperties target, IReadOnlyList<(string Name, PropVariant Value)> properties)
+    {
+        IntPtr names = Marshal.AllocHGlobal(IntPtr.Size * properties.Count), values = Marshal.AllocHGlobal(24 * properties.Count);
+        var allocations = new List<IntPtr>();
+        try
+        {
+            for (int i = 0; i < properties.Count; i++)
+            {
+                IntPtr name = Marshal.StringToCoTaskMemUni(properties[i].Name); allocations.Add(name); Marshal.WriteIntPtr(names, i * IntPtr.Size, name);
+                Marshal.StructureToPtr(properties[i].Value, values + 24 * i, false);
+            }
+            Native.Check(target.SetProperties(names, values, (uint)properties.Count), "压缩引擎不支持所选参数。");
+        }
+        finally
+        {
+            foreach (var property in properties) { PropVariant value = property.Value; value.Clear(); }
+            foreach (IntPtr pointer in allocations) Marshal.FreeCoTaskMem(pointer); Marshal.FreeHGlobal(names); Marshal.FreeHGlobal(values);
+        }
+    }
+
+    private Stream OpenSource(string path) => path.EndsWith(".001", StringComparison.OrdinalIgnoreCase) ? new ConcatenatedStream(VolumePaths(path)) : new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+    private List<string> VolumePaths(string first)
+    {
+        string prefix = first[..^3], directory = Path.GetDirectoryName(first)!, baseName = Path.GetFileName(prefix);
+        var parts = Directory.EnumerateFiles(directory, baseName + "*").Select(x => (Path: x, Suffix: Path.GetFileName(x)[baseName.Length..]))
+            .Where(x => x.Suffix.Length >= 3 && x.Suffix.All(char.IsAsciiDigit)).Select(x => (x.Path, Index: int.TryParse(x.Suffix, out int index) ? index : -1)).OrderBy(x => x.Index).ToList();
+        if (parts.Count == 0 || parts.Count > 10000) throw new WorkerException("missing-volume", "未找到有效的分卷文件。");
+        for (int i = 0; i < parts.Count; i++) if (parts[i].Index != i + 1) throw new WorkerException("missing-volume", "压缩包分卷不完整或编号重复。", "请将全部分卷放在同一文件夹，从 .001 开始打开。");
+        return parts.Select(x => x.Path).ToList();
+    }
+    private long SourceLength(string source) => source.EndsWith(".001", StringComparison.OrdinalIgnoreCase) ? VolumePaths(source).Sum(x => new FileInfo(x).Length) : new FileInfo(source).Length;
+    private string FullSource()
+    {
+        if (!Path.IsPathFullyQualified(_request.SourcePath!)) throw new WorkerException("invalid-request", "源压缩包必须为绝对路径。");
+        string path = Path.GetFullPath(_request.SourcePath!); Safety.RejectReparse(path);
+        if (!File.Exists(path)) throw new WorkerException("source-missing", "源压缩包已不存在。"); return path;
+    }
+    private static void CannotOpen(bool passwordNeeded) => throw new WorkerException(passwordNeeded ? "password-required" : "invalid-archive", passwordNeeded ? "密码缺失、错误或加密头已损坏。" : "无法打开此压缩包或不支持其格式。", "请检查密码、压缩包完整性和分卷文件。");
+    private static long SumKnown(IReadOnlyList<ArchiveEntry> entries) => entries.Sum(x => x.Size ?? 0);
+    private static string GuessFormat(string source)
+    {
+        string name = source.ToLowerInvariant(); if (name.EndsWith(".001")) name = name[..^4];
+        foreach (string format in new[] { "tar.gz", "tar.bz2", "tar.xz", "7z", "zip", "rar", "tar", "gz", "bz2", "xz" }) if (name.EndsWith("." + format)) return format;
+        if (name.EndsWith(".tgz")) return "tar.gz"; if (name.EndsWith(".tbz2") || name.EndsWith(".tbz")) return "tar.bz2"; if (name.EndsWith(".txz")) return "tar.xz"; return "";
+    }
+    private static bool IsTarWrapper(string source) => GuessFormat(source).StartsWith("tar.", StringComparison.Ordinal);
+    private static string DisplayFormat(string format, string source) => IsTarWrapper(source) ? GuessFormat(source) : format.ToLowerInvariant() switch { "gzip" => "gz", "bzip2" => "bz2", "rar5" => "rar", var result => result };
+    private static string StripExtension(string name)
+    {
+        if (name.EndsWith(".001", StringComparison.OrdinalIgnoreCase)) name = name[..^4];
+        foreach (string extension in new[] { ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".tbz", ".txz" }) if (name.EndsWith(extension, StringComparison.OrdinalIgnoreCase)) return name[..^extension.Length];
+        return Path.GetFileNameWithoutExtension(name);
+    }
+    private List<string> Split(string archivePath, string folder, string name, long split)
+    {
+        var parts = new List<string>(); using var input = File.OpenRead(archivePath); long copied = 0;
+        while (input.Position < input.Length)
+        {
+            _token.ThrowIfCancellationRequested(); if (parts.Count >= 10000) throw new WorkerException("volume-limit", "分卷数量超过 10000 卷。");
+            string part = Path.Combine(folder, name + "." + (parts.Count + 1).ToString("D3"));
+            using var output = _journal!.CreateFile(part, FileAccess.Write);
+            long amount = Math.Min(split, input.Length - input.Position);
+            Copy(input, output, amount, count => { copied += count; Protocol.Progress(copied, input.Length, parts.Count, null, null, "splitting"); }); parts.Add(part);
+        }
+        return parts;
+    }
+    private void Copy(Stream input, Stream output, long length, Action<int> progress)
+    {
+        byte[] buffer = new byte[131072]; long remaining = length;
+        while (remaining > 0)
+        {
+            _token.ThrowIfCancellationRequested(); int read = input.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining));
+            if (read == 0) throw new WorkerException("source-changed", "源文件在读取过程中发生变化。"); output.Write(buffer, 0, read); remaining -= read; progress(read);
+        }
+    }
+    private byte[] ComputeHash(Stream input)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256); byte[] buffer = new byte[131072]; long processed = 0;
+        for (;;)
+        {
+            _token.ThrowIfCancellationRequested(); int read = input.Read(buffer); if (read == 0) break;
+            hash.AppendData(buffer.AsSpan(0, read)); processed += read; Protocol.Progress(processed, input.Length, 0, null, null, "verifying-volumes");
+        }
+        return hash.GetHashAndReset();
+    }
+    private void PrepareWork(string directory)
+    {
+        directory = Path.GetFullPath(directory); Safety.RejectReparse(directory); Directory.CreateDirectory(directory);
+        string work = _request.WorkDirectory ?? Path.Combine(directory, ".cat-archive-" + Guid.NewGuid().ToString("N"));
+        work = Path.GetFullPath(work);
+        if (!string.Equals(Path.GetDirectoryName(work), Path.TrimEndingDirectorySeparator(directory), StringComparison.OrdinalIgnoreCase) || !Path.GetFileName(work).StartsWith(".cat-archive-", StringComparison.Ordinal))
+            throw new WorkerException("invalid-request", "无效的任务临时文件夹。");
+        EnsureNewTarget(work);
+        if (string.IsNullOrWhiteSpace(_request.JournalPath)) throw new WorkerException("invalid-request", "Archive staging receipt is missing.");
+        _work = work;
+        _journal = ArchiveTemporaryJournal.Open(_request.JournalPath, work);
+        _journal.CreateDirectory(work);
+    }
+    private static void EnsureNewTarget(string path)
+    {
+        Safety.RejectReparse(path); if (File.Exists(path) || Directory.Exists(path)) throw new WorkerException("output-exists", "输出位置已有同名文件或文件夹。", "请更改名称或选择其他输出文件夹。");
+    }
+    private string Commit(string staged, string requestedPath, bool directory)
+    {
+        string parent = Path.GetDirectoryName(requestedPath)!, name = Path.GetFileName(requestedPath);
+        Safety.RejectReparse(parent);
+        string extension = directory ? "" : name.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase) ? ".tar.gz" : Path.GetExtension(name);
+        string stem = name[..(name.Length - extension.Length)];
+        for (int number = 1; number < 100000; number++)
+        {
+            _token.ThrowIfCancellationRequested();
+            string candidate = Path.Combine(parent, number == 1 ? name : $"{stem} ({number}){extension}");
+            if (File.Exists(candidate) || Directory.Exists(candidate)) continue;
+            try
+            {
+                Safety.RejectReparse(candidate);
+                if (directory) Directory.Move(staged, candidate); else File.Move(staged, candidate, false);
+                return candidate;
+            }
+            catch (IOException) when (File.Exists(candidate) || Directory.Exists(candidate)) { /* A concurrent task claimed this name; try the next without overwriting. */ }
+        }
+        throw new WorkerException("output-conflict", "输出目录中的同名项目过多。", "请选择其他输出文件夹或名称。");
+    }
+    private Result Success(string? path, string kind, long output, string? format, bool passwordRequired) => new() { Status = "completed", OutputPath = path, OutputKind = kind, SourceBytes = _sourceBytes, OutputBytes = output, EntryCount = _entryCount, Format = format, RequiresPassword = passwordRequired };
+    public void Dispose()
+    {
+        try { _journal?.Dispose(); } catch (IOException) { /* Keep the receipt for parent cleanup. */ }
+        if (_request.JournalPath is { } journal) _ = ArchiveTemporaryJournal.Cleanup(journal);
+        // Keep 7z.dll loaded until process exit: the COM runtime may retain RCWs.
+        GC.KeepAlive(_library);
+    }
+}
+
+internal sealed class NativeArchive(IInArchive archive, InputStream stream, OpenCallback callback, string format, string path, bool headerEncrypted = false) : IDisposable
+{
+    private OpenCallback _callback = callback;
+    internal IInArchive Archive { get; } = archive;
+    internal string Format { get; } = format;
+    internal string SourcePath { get; } = path;
+    internal bool HeaderEncrypted { get; } = headerEncrypted;
+    internal Exception? ReadError => stream.Error ?? _callback.Error;
+    internal bool MissingVolumeRequested => _callback.MissingVolumeRequested;
+    internal bool Reopen(string password, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        Archive.Close(); _callback.Dispose();
+        Native.Check(stream.Seek(0, 0, IntPtr.Zero));
+        _callback = new OpenCallback(SourcePath, password, token);
+        IntPtr position = Marshal.AllocHGlobal(8);
+        int status;
+        try { Marshal.WriteInt64(position, 0); status = Archive.Open(stream, position, _callback); }
+        finally { Marshal.FreeHGlobal(position); }
+        if (_callback.Error is { } error) throw error;
+        if (stream.Error is { } inputError) throw inputError;
+        token.ThrowIfCancellationRequested();
+        RecoveryNativeStatus.CheckFatal(status);
+        if (status == Native.Ok)
+        {
+            // RAR4 can return S_OK for a wrong encrypted-header candidate while
+            // reporting a header error / UnexpectedEnd and no items. S_OK does not authenticate
+            // those headers; do not classify this candidate as an unverifiable archive.
+            if (HeaderEncrypted && Format.Equals("Rar", StringComparison.OrdinalIgnoreCase)
+                && _callback.PasswordRequested)
+            {
+                PropVariant flags = default;
+                try
+                {
+                    Native.Check(Archive.GetArchiveProperty((uint)Property.ErrorFlags, ref flags));
+                    const ulong invalidHeaderFlags = (1UL << 1) | (1UL << 2) | (1UL << 5);
+                    if ((flags.Number.GetValueOrDefault() & invalidHeaderFlags) != 0)
+                    {
+                        if (_callback.MissingVolumeRequested)
+                            throw new WorkerException("missing-volume", "压缩包数据或分卷不可用。", "请补齐全部分卷后重试。");
+                        return false;
+                    }
+                }
+                finally { flags.Clear(); }
+            }
+            return true;
+        }
+        if (_callback.MissingVolumeRequested)
+            throw new WorkerException("missing-volume", "压缩包数据或分卷不可用。", "请补齐全部分卷后重试。");
+        if (_callback.PasswordRequested) return false;
+        throw new WorkerException("corrupt-archive", "无法读取加密压缩包的头部。", "请检查压缩包完整性和所有分卷。");
+    }
+    public void Dispose() { Archive.Close(); Marshal.FinalReleaseComObject(Archive); stream.Dispose(); _callback.Dispose(); }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.ArchiveWorker/Streams.cs ---
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Copyright (c) 2026 CatFileAssistant contributors.
+using System.Runtime.InteropServices;
+
+namespace CatFileAssistant.ArchiveWorker;
+
+internal sealed class ByteBudget(long maximum, CancellationToken token)
+{
+    private long _bytes;
+    internal long Bytes => Interlocked.Read(ref _bytes);
+    internal void Add(uint count)
+    {
+        token.ThrowIfCancellationRequested();
+        long result = Interlocked.Add(ref _bytes, count);
+        if (result < 0 || result > maximum) throw new WorkerException("size-limit", "解压后的实际数据量超过安全限额。", "请缩小解压范围，或在设置中调整安全限额。");
+    }
+}
+
+[ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+public sealed class InputStream : IInStream, ISequentialInStream, IDisposable
+{
+    private readonly Stream _stream;
+    private readonly CancellationToken _token;
+    internal Exception? Error { get; private set; }
+    internal InputStream(Stream stream, CancellationToken token) { _stream = stream; _token = token; }
+    public unsafe int Read(IntPtr data, uint size, IntPtr processedSize)
+    {
+        Native.Write32(processedSize, 0);
+        try
+        {
+            _token.ThrowIfCancellationRequested();
+            int count = _stream.Read(new Span<byte>((void*)data, checked((int)size)));
+            Native.Write32(processedSize, (uint)count);
+            return Native.Ok;
+        }
+        catch (Exception ex) { Error = ex; return ex is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public int Seek(long offset, uint origin, IntPtr newPosition)
+    {
+        try { _token.ThrowIfCancellationRequested(); Native.Write64(newPosition, checked((ulong)_stream.Seek(offset, (SeekOrigin)origin))); return Native.Ok; }
+        catch (Exception ex) { Error = ex; return ex is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public void Dispose() => _stream.Dispose();
+}
+
+[ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+public sealed class OutputStream : ISequentialOutStream, IOutStream, IDisposable
+{
+    private readonly Stream _stream;
+    private readonly CancellationToken _token;
+    private readonly ByteBudget? _budget;
+    private readonly long _maximum;
+    private long _written;
+    internal Exception? Error { get; private set; }
+    internal long Bytes => _written;
+    internal OutputStream(Stream stream, CancellationToken token, long maximum, ByteBudget? budget = null)
+    { _stream = stream; _token = token; _maximum = maximum; _budget = budget; }
+    public unsafe int Write(IntPtr data, uint size, IntPtr processedSize)
+    {
+        Native.Write32(processedSize, 0);
+        try
+        {
+            _token.ThrowIfCancellationRequested();
+            if (size > _maximum - _written) throw new WorkerException("size-limit", "文件的实际数据量超过安全限额。");
+            _budget?.Add(size);
+            _stream.Write(new ReadOnlySpan<byte>((void*)data, checked((int)size)));
+            _written = checked(_written + size);
+            Native.Write32(processedSize, size);
+            return Native.Ok;
+        }
+        catch (Exception ex) { Error = ex; return ex is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public int Seek(long offset, uint origin, IntPtr newPosition)
+    {
+        try { _token.ThrowIfCancellationRequested(); Native.Write64(newPosition, checked((ulong)_stream.Seek(offset, (SeekOrigin)origin))); return Native.Ok; }
+        catch (Exception ex) { Error = ex; return ex is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public int SetSize(ulong size)
+    {
+        try { _token.ThrowIfCancellationRequested(); if (size > (ulong)_maximum) throw new WorkerException("size-limit", "压缩包超过安全限额。"); _stream.SetLength(checked((long)size)); return Native.Ok; }
+        catch (Exception ex) { Error = ex; return ex is OperationCanceledException ? Native.Abort : Native.Fail; }
+    }
+    public void Dispose() => _stream.Dispose();
+}
+
+internal sealed class ConcatenatedStream : Stream
+{
+    private readonly FileStream[] _parts;
+    private readonly long[] _starts;
+    private readonly long _length;
+    private long _position;
+    internal ConcatenatedStream(IReadOnlyList<string> paths)
+    {
+        _parts = new FileStream[paths.Count]; _starts = new long[paths.Count];
+        try
+        {
+            for (int i = 0; i < paths.Count; i++)
+            {
+                Safety.RejectReparse(paths[i]);
+                _parts[i] = new FileStream(paths[i], FileMode.Open, FileAccess.Read, FileShare.Read);
+                _starts[i] = _length; _length = checked(_length + _parts[i].Length);
+            }
+        }
+        catch { foreach (var file in _parts) file?.Dispose(); throw; }
+    }
+    public override bool CanRead => true;
+    public override bool CanSeek => true;
+    public override bool CanWrite => false;
+    public override long Length => _length;
+    public override long Position { get => _position; set => Seek(value, SeekOrigin.Begin); }
+    public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+    public override int Read(Span<byte> buffer)
+    {
+        if (_position >= _length || buffer.Length == 0) return 0;
+        int i = Array.BinarySearch(_starts, _position); if (i < 0) i = ~i - 1;
+        while (i < _parts.Length)
+        {
+            var file = _parts[i]; file.Position = _position - _starts[i];
+            int got = file.Read(buffer); if (got > 0) { _position += got; return got; } i++;
+        }
+        return 0;
+    }
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        long result = checked((origin == SeekOrigin.Begin ? 0 : origin == SeekOrigin.Current ? _position : _length) + offset);
+        if (result < 0) throw new IOException("Negative stream position."); _position = result; return result;
+    }
+    public override void Flush() { }
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    protected override void Dispose(bool disposing) { if (disposing) foreach (var file in _parts) file.Dispose(); base.Dispose(disposing); }
+}
+
+// 7-Zip owns native stream references. CCW release does not invoke IDisposable,
+// so snapshot inputs close their OS handle at EOF and reopen only for a seek.
+internal sealed class DeferredReadStream(string path) : Stream
+{
+    private FileStream? _file;
+    private long _position;
+    private readonly long _length = new FileInfo(path).Length;
+    public override bool CanRead => true;
+    public override bool CanSeek => true;
+    public override bool CanWrite => false;
+    public override long Length => _length;
+    public override long Position { get => _position; set => Seek(value, SeekOrigin.Begin); }
+    public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+    public override int Read(Span<byte> buffer)
+    {
+        if (_position >= _length) return 0;
+        _file ??= new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        _file.Position = _position;
+        int read = _file.Read(buffer); _position += read;
+        if (_position >= _length) { _file.Dispose(); _file = null; }
+        return read;
+    }
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        long result = checked((origin == SeekOrigin.Begin ? 0 : origin == SeekOrigin.Current ? _position : _length) + offset);
+        if (result < 0) throw new IOException("Negative stream position."); _position = result; return result;
+    }
+    public override void Flush() { }
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    protected override void Dispose(bool disposing) { if (disposing) _file?.Dispose(); _file = null; base.Dispose(disposing); }
+}
+

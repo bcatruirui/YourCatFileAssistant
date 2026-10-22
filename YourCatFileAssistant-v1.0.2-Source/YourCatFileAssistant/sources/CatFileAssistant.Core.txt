@@ -1,0 +1,1977 @@
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/ArchiveContracts.cs ---
+namespace CatFileAssistant.Core;
+
+public enum ArchiveOperation { Create, Extract }
+public enum ArchiveFormat { Zip, SevenZip, Tar, TarGZip }
+public enum ArchiveLevel { Store = 0, Fast = 1, Standard = 5, Ultra = 9 }
+public enum ArchiveGrouping { Combined, Separate }
+public enum ArchiveOutputKind { File, Directory }
+
+public sealed record ArchiveLimits(int MaximumEntries = 100_000, int MaximumDepth = 64,
+    long MaximumBytes = 100L * 1024 * 1024 * 1024);
+public sealed record ArchiveCreateOptions(ArchiveFormat Format = ArchiveFormat.Zip,
+    ArchiveLevel Level = ArchiveLevel.Standard, string? Password = null, long? SplitBytes = null);
+public sealed record ArchiveExtractOptions(string? Password = null, ArchiveLimits? Limits = null);
+
+public abstract record ArchiveRequest(Guid Id, string OutputDirectory);
+public sealed record CreateArchiveRequest(Guid Id, IReadOnlyList<string> SourcePaths,
+    string OutputDirectory, string ArchiveName, ArchiveCreateOptions Options)
+    : ArchiveRequest(Id, OutputDirectory);
+public sealed record ExtractArchiveRequest(Guid Id, string SourcePath, string OutputDirectory,
+    ArchiveExtractOptions Options) : ArchiveRequest(Id, OutputDirectory);
+public sealed record ArchiveProgress(double? Percent, long ProcessedBytes, long? TotalBytes,
+    int ProcessedEntries, int? TotalEntries, string? CurrentEntry = null, string? Stage = null);
+public sealed record ArchiveStatistics(long SourceBytes, long OutputBytes, int EntryCount)
+{
+    public double ReductionPercent => SourceBytes > 0 ? (1d - (double)OutputBytes / SourceBytes) * 100 : 0;
+}
+public sealed record ArchiveInspection(string SourcePath, string? Format, long SourceBytes,
+    int EntryCount, bool RequiresPassword, ConversionError? Error = null)
+{
+    public bool Accepted => Error is null;
+}
+public sealed record ArchiveResult(JobStatus Status, string? OutputPath, ArchiveOutputKind OutputKind,
+    ConversionError? Error = null, ArchiveStatistics? Statistics = null);
+
+public interface IArchiveEngine
+{
+    Task<ArchiveInspection> InspectAsync(string sourcePath, string? password = null,
+        CancellationToken cancellationToken = default);
+    Task<ArchiveResult> ExecuteAsync(ArchiveRequest request,
+        IProgress<ArchiveProgress>? progress = null, CancellationToken cancellationToken = default);
+}
+
+public static class ArchiveCapabilities
+{
+    public static string Extension(ArchiveFormat format) => format switch
+    {
+        ArchiveFormat.SevenZip => ".7z", ArchiveFormat.Tar => ".tar",
+        ArchiveFormat.TarGZip => ".tar.gz", _ => ".zip"
+    };
+    public static string Name(ArchiveFormat format) => format switch
+    {
+        ArchiveFormat.SevenZip => "7Z", ArchiveFormat.Tar => "TAR",
+        ArchiveFormat.TarGZip => "TAR.GZ", _ => "ZIP"
+    };
+    public static bool SupportsPassword(ArchiveFormat format) => format is ArchiveFormat.Zip or ArchiveFormat.SevenZip;
+    public static bool SupportsSplit(ArchiveFormat format) => format == ArchiveFormat.SevenZip;
+    public static IReadOnlyList<ArchiveLevel> Levels(ArchiveFormat format) => format switch
+    {
+        ArchiveFormat.Tar => new[] { ArchiveLevel.Store },
+        ArchiveFormat.TarGZip => new[] { ArchiveLevel.Fast, ArchiveLevel.Standard, ArchiveLevel.Ultra },
+        _ => new[] { ArchiveLevel.Store, ArchiveLevel.Fast, ArchiveLevel.Standard, ArchiveLevel.Ultra }
+    };
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/AssistantStateRules.cs ---
+namespace CatFileAssistant.Core;
+
+/// <summary>Brand state is derived from task outcomes, never from translated UI text.</summary>
+public static class AssistantStateRules
+{
+    public static AssistantState ForBatch(IEnumerable<JobStatus> statuses)
+    {
+        var values = statuses.ToArray();
+        if (values.Contains(JobStatus.Processing)) return AssistantState.PROCESSING;
+        if (values.Contains(JobStatus.Failed)) return AssistantState.ERROR;
+        if (values.Length > 0 && values.All(value => value == JobStatus.Completed)) return AssistantState.SUCCESS;
+        return AssistantState.IDLE;
+    }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/CatFileAssistant.Core.csproj ---
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework><Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup><EmbeddedResource Include="Localization\en-US.json" LogicalName="CatFileAssistant.Core.Localization.en-US.json" /></ItemGroup>
+</Project>
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/Contracts.cs ---
+namespace CatFileAssistant.Core;
+
+public enum ConversionMode { Video, Audio, Image, Extract, Gif }
+public enum JobStatus { Pending, Processing, Completed, Failed, Cancelled }
+public enum AssistantState { IDLE, DRAGGING, PROCESSING, SUCCESS, ERROR }
+public enum MotionPreference { System, Reduced }
+public enum PetMotionMode { Gentle, System, Reduced }
+public enum CompressionMode { None, Standard, TargetSize }
+public enum CompressionLevel { Large, Medium, Small, Tiny }
+public enum GifQualityLevel { Original, High, Medium, Low, VeryLow }
+public sealed record GifOptions(GifQualityLevel Quality = GifQualityLevel.Medium);
+public sealed record GifStatistics(long SourceBytes, long OutputBytes);
+
+public sealed record CompressionOptions(CompressionMode Mode, CompressionLevel Level = CompressionLevel.Medium,
+    long? MaximumBytes = null, bool PreserveSourceFormat = true)
+{
+    public double Ratio => Level switch { CompressionLevel.Large => .8, CompressionLevel.Medium => .5, CompressionLevel.Small => .3, CompressionLevel.Tiny => .15, _ => .5 };
+    public long TargetBytes(long sourceBytes) => Mode == CompressionMode.TargetSize
+        ? MaximumBytes ?? 0 : (long)Math.Floor(sourceBytes * Ratio);
+}
+
+public sealed record AudioStreamInfo(int Index, string Codec, int SampleRate, int Channels, double DurationSeconds,
+    long BitRate = 0, string? Language = null, string? Title = null);
+public sealed record SubtitleStreamInfo(int Index, string Codec, string? Language = null, string? Title = null);
+public sealed record AnimationInfo(int FrameCount, long DurationMilliseconds, int LoopCount,
+    IReadOnlyList<int> FrameDurationsMilliseconds, bool IsGif = false)
+{
+    public bool IsAnimated => FrameCount > 1;
+}
+public sealed record CompressionStatistics(long SourceBytes, long OutputBytes, long TargetBytes, int Attempts,
+    bool AlreadyWithinLimit = false)
+{
+    public double ReductionPercent => SourceBytes > 0 ? (1d - (double)OutputBytes / SourceBytes) * 100 : 0;
+}
+
+public sealed record FormatPreset(string Id, string Name, string Extension, string Codec,
+    ConversionMode Mode, string Container, string ExpectedCodec);
+public sealed record MediaInfo(bool HasVideo, bool HasAudio, double DurationSeconds,
+    string FormatName, string? VideoCodec, string? AudioCodec, long SourceBytes = 0,
+    int Width = 0, int Height = 0, double FrameRate = 0,
+    IReadOnlyList<AudioStreamInfo>? AudioStreams = null, IReadOnlyList<SubtitleStreamInfo>? SubtitleStreams = null,
+    bool HasAlpha = false, AnimationInfo? Animation = null, bool HasUnsupportedAnimation = false);
+public sealed record ConversionError(string Code, string Message, string Suggestion,
+    string? DiagnosticId = null, string? TechnicalDetails = null);
+public sealed record ConversionRequest(Guid Id, string SourcePath, FormatPreset Preset, string OutputDirectory,
+    CompressionOptions? Compression = null, GifOptions? Gif = null);
+public sealed record ConversionProgress(double? Percent, TimeSpan Position, int Attempt = 1, int MaximumAttempts = 1);
+public sealed record ConversionResult(JobStatus Status, string? OutputPath, ConversionError? Error,
+    CompressionStatistics? Statistics = null, GifStatistics? GifStatistics = null);
+
+public interface IConversionEngine
+{
+    Task<MediaInfo> ProbeAsync(string path, CancellationToken cancellationToken = default);
+    Task<ConversionResult> ConvertAsync(ConversionRequest request,
+        IProgress<ConversionProgress>? progress = null, CancellationToken cancellationToken = default);
+}
+
+public sealed class ConversionEngineException(ConversionError error) : Exception(error.Message)
+{
+    public ConversionError Error { get; } = error;
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/DesktopPetTaskContracts.cs ---
+namespace CatFileAssistant.Core;
+
+public enum FileProcessingAction
+{
+    Video, Audio, Image, ExtractAudio, CompressMedia, Gif,
+    CreateArchive, ExtractArchive, RecoverPassword, ObfuscateImage, DeobfuscateImage
+}
+
+public sealed record FileActionChoice(FileProcessingAction Action, string Title,
+    IReadOnlyList<string> CompatiblePaths, int TotalCount)
+{
+    public int CompatibleCount => CompatiblePaths.Count;
+}
+
+public sealed record FileImportRejection(string SourcePath, string Reason);
+public sealed record FileImportResult(IReadOnlyList<string> AttemptedPaths,
+    IReadOnlyList<string> AcceptedPaths, IReadOnlyList<FileImportRejection> RejectedPaths, bool Busy = false);
+
+/// <summary>A presentation-safe task receipt. OperationId identifies one actual execution,
+/// including all its size-calibration passes; retries get a new ID. Passwords, recovery
+/// candidates and diagnostics are excluded.</summary>
+public sealed record ProcessingTaskSnapshot(Guid OperationId, Guid BatchId, FileProcessingAction Action,
+    string DisplayName, JobStatus Status, double? Percent, string? Stage, int Index, int Count,
+    string? OutputPath = null, bool OutputIsDirectory = false, string? ErrorMessage = null);
+
+public sealed record ProcessingBatchSummary(Guid BatchId, FileProcessingAction Action,
+    int CompletedCount, int FailedCount, int CancelledCount, int ExhaustedCount, int PendingCount,
+    IReadOnlyList<Guid> SuccessfulRequestIds, IReadOnlyList<ProcessingTaskSnapshot> Tasks, bool Cancelled)
+{
+    public int SuccessfulCount => SuccessfulRequestIds.Count;
+    public IReadOnlyList<ProcessingTaskSnapshot> Results => Tasks;
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/ImageObfuscationContracts.cs ---
+namespace CatFileAssistant.Core;
+
+public enum ImageObfuscationOperation { Obfuscate, Deobfuscate }
+public enum ImageObfuscationMode { Gilbert, Block, Pixel }
+
+public sealed record ImageObfuscationOptions(ImageObfuscationMode Mode = ImageObfuscationMode.Gilbert, int Iterations = 1);
+public sealed record ImageObfuscationRequest(Guid Id, string SourcePath, string OutputDirectory,
+    ImageObfuscationOperation Operation, ImageObfuscationOptions Options);
+public sealed record ImageObfuscationProgress(double? Percent, string Stage);
+public sealed record ImageObfuscationStatistics(long SourceBytes, long OutputBytes, int Width, int Height,
+    ImageObfuscationMode Mode, int Iterations, bool Verified);
+public sealed record ImageObfuscationResult(JobStatus Status, string? OutputPath, ConversionError? Error,
+    ImageObfuscationStatistics? Statistics = null);
+public sealed record ImageObfuscationInfo(int Width, int Height, int BitDepth, bool HasAlpha, bool IsMarked,
+    ImageObfuscationMode? StoredMode = null, int StoredIterations = 1);
+
+public interface IImageObfuscationEngine
+{
+    Task<ImageObfuscationInfo> InspectAsync(string path, CancellationToken cancellationToken = default);
+    Task<ImageObfuscationResult> ProcessAsync(ImageObfuscationRequest request,
+        IProgress<ImageObfuscationProgress>? progress = null, CancellationToken cancellationToken = default);
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/Localization/en-US.json ---
+{
+  "\n\nFFmpeg / ffprobe 随附引擎的 GPL 许可全文：\n": "\n\nFull GPL license for the bundled FFmpeg / ffprobe engine:\n",
+  "\n……共 {0} 项": "\n… {0} items in total",
+  "\n获得 {0} 喵喵币": "\nEarned {0} Meow Coins",
+  "\n奖励待保存，可在桌宠页重试。": "\nRewards are waiting to be saved. Retry on the pet page.",
+  "\n正在处理文件，结束后再选择功能。": "\nFiles are being processed. Choose an action when finished.",
+  " · {0} 份": " · {0} portions",
+  " · {0} 个待选格式": " · {0} awaiting format",
+  " · {0} 个未找到": " · {0} not found",
+  " · {0} 个遇到问题": " · {0} with issues",
+  " · {0} 项遇到问题": " · {0} with issues",
+  " · {0} 项暂未找到密码": " · {0} passwords not found",
+  " · 保留动画": " · Keep animation",
+  " · 保留格式": " · Keep format",
+  " · 保留原格式": " · Keep original format",
+  " · 动图": " · Animated",
+  " · 含透明区域": " · Contains transparency",
+  " · 节省 {0:0.#}%": " · Saved {0:0.#}%",
+  " · 需要密码": " · Password required",
+  " · 已停止": " · Stopped",
+  " · 有任务已停止": " · Some tasks stopped",
+  " · 增加 {0:0.#}%": " · Increased {0:0.#}%",
+  " · 正在处理": " · Processing",
+  " · 自动识别": " · Auto-detect",
+  "_混淆": "_obfuscated",
+  "_解混淆": "_restored",
+  "_压缩": "_compressed",
+  ".分卷": ".volume",
+  "{0}    可接收 {1} / {2} 项": "{0}    Accepts {1} / {2} items",
+  "{0} · {1} 次": "{0} · {1} passes",
+  "{0} · {1} 次 · PNG": "{0} · {1} passes · PNG",
+  "{0} · {1} 位数字 · {2}": "{0} · {1} digits · {2}",
+  "{0} · ≤原体积 {1:P0}": "{0} · ≤{1:P0} of original size",
+  "{0} · 剩余 {1:mm\\\\:ss}": "{0} · {1:mm\\:ss} remaining",
+  "{0} → {1}{2} · {3} 个条目": "{0} → {1}{2} · {3} entries",
+  "{0} 个{1} · {2} 个完成": "{0} {1} · {2} completed",
+  "{0} 个输入 · ": "{0} inputs · ",
+  "{0} 个输入合并打包": "Combine {0} inputs into one archive",
+  "{0} 个文件 · {1} 个完成": "{0} files · {1} completed",
+  "{0} 个压缩包 · {1} 个找到密码": "{0} archives · {1} passwords found",
+  "{0} 喵喵币": "{0} Meow Coins",
+  "{0} 喵喵币 · 和桌面猫咪共享互动与装扮": "{0} Meow Coins · Shared play and accessories with your desktop cat",
+  "{0} 张图片 · {1} 个完成": "{0} images · {1} completed",
+  "{0}：请选择 ZIP、7Z 或 RAR 压缩包。": "{0}: Choose a ZIP, 7Z or RAR archive.",
+  "{0}：请选择支持的静态图片。": "{0}: Choose a supported still image.",
+  "{0}：压缩包无需密码。": "{0}: This archive does not need a password.",
+  "●  {0} 喵喵币": "●  {0} Meow Coins",
+  "1–10 次 · 输出 PNG · 无密码": "1–10 passes · PNG output · No password",
+  "4 位": "4 digits",
+  "6 位": "6 digits",
+  "7-Zip 引擎|7z.dll|DLL 文件|*.dll": "7-Zip engine|7z.dll|DLL files|*.dll",
+  "7-Zip 引擎文件（7z.dll · Windows x64）": "7-Zip engine file (7z.dll · Windows x64)",
+  "7Z · 更高压缩": "7Z · Higher compression",
+  "7Z 分卷": "Split 7Z archive",
+  "7Z 密码最多 1024 个字符。": "7Z passwords can contain up to 1,024 characters.",
+  "7Z 使用 LZMA2；启用密码后同时加密文件名。分卷请保留全部 .001、.002 等文件。": "7Z uses LZMA2 and encrypts file names when password protection is enabled. Keep every .001, .002 and subsequent volume.",
+  "安心处理": "Process with confidence",
+  "按每个文件的大小上限自动调整清晰度与尺寸。": "Automatically adjust quality and dimensions to each file's size limit.",
+  "按文件名或文件信息查找": "Search file names or details",
+  "把文件夹交给猫咪": "Give your folders to the cat",
+  "把文件交给猫咪": "Give your files to the cat",
+  "把文件交给猫咪，再选择处理方式": "Give your files to the cat, then choose an action",
+  "把文件交给我，也留一点时间给自己。": "Leave the files with me, and save a little time for yourself.",
+  "把文件交给我吧！": "Leave the files with me!",
+  "包名称": "Archive name",
+  "包装层不包含有效的 TAR 压缩包。": "The wrapper does not contain a valid TAR archive.",
+  "保存本次密码": "Save password for this task",
+  "保存到": "Save to",
+  "保存列表": "Save list",
+  "保存位置的空间不足。": "There is not enough space at the save location.",
+  "保存无损 PNG": "Save lossless PNG",
+  "保存引擎与保护设置": "Save engine and safety settings",
+  "保留更多细节": "Keep more detail",
+  "保留原文件": "Keep original files",
+  "保留源分辨率和全部帧；GIF 最多 256 色，帧间隔以 10 毫秒计，体积可能明显增大。": "Preserves source resolution and every frame. GIF supports 256 colors and 10 ms frame intervals; files may become much larger.",
+  "保留源分辨率和全部帧；GIF 最多 256 色，帧间隔以 10 毫秒计。体积可能明显增大。": "Preserves source resolution and every frame. GIF supports 256 colors and 10 ms frame intervals. Files may become much larger.",
+  "背包里已经有这件物品了。": "You already have this item in your inventory.",
+  "背包里已经装满了这件物品。": "Your inventory cannot hold any more of this item.",
+  "背包里暂时没有这份食物。": "This food is not in your inventory yet.",
+  "本次 {0} 个归档任务完成 · 原文件已保留": "{0} archive tasks completed · Original files kept",
+  "本次 {0} 个文件已完成 · 原文件已保留": "{0} files completed · Original files kept",
+  "本次 {0} 张图片已完成 · 原文件已保留": "{0} images completed · Original files kept",
+  "本次工作已结算。": "This work session has been settled.",
+  "本次工作正在累计中。": "This work session is already running.",
+  "本次会话常用数字列表": "Common numbers for this session",
+  "本次图片已处理 · 无原图摘要的结果请自行确认": "Images processed · Check results without an original-image digest yourself",
+  "本次完成 {0} 个，{1} 个遇到问题": "{0} completed, {1} with issues",
+  "本次完成 {0} 个任务，{1} 个遇到问题": "{0} tasks completed, {1} with issues",
+  "本地尝试 4 位或 6 位纯数字密码；原压缩包保持不变。": "Try 4- or 6-digit numeric passwords locally. The original archive is kept unchanged.",
+  "本地处理 · 文件不会上传": "Local processing · Files are never uploaded",
+  "本地处理 · Gilbert、方块、全像素 · 无密码 · 保留原文件；混淆不提供加密保护。": "Local processing · Gilbert, blocks, all pixels · No password · Original files kept. Obfuscation is not encryption.",
+  "本地处理引擎": "Local processing engines",
+  "本方案共 {0:N0} 个候选": "{0:N0} candidates in this plan",
+  "本软件生成的图片会自动识别模式和次数并校验；其他图片按所选参数尝试，结果需自行确认。": "Images created by this app are detected and verified automatically. Other images use your chosen settings; check their results yourself.",
+  "标准": "Standard",
+  "不支持的压缩格式或档位。": "Unsupported archive format or compression level.",
+  "不支持的压缩任务类型。": "Unsupported archive task type.",
+  "部分路径无法读取，请重新选择。": "Some paths cannot be read. Select them again.",
+  "部分图片遇到了问题。": "Some images encountered a problem.",
+  "部分文件未能压缩。": "Some files could not be compressed.",
+  "部分压缩包遇到了问题。": "Some archives encountered a problem.",
+  "参数用于": "Apply settings to",
+  "操作": "Actions",
+  "操作未完成 · 可以查看原因": "Action incomplete · View details",
+  "查看": "View",
+  "查看本次会话的任务、处理状态与结果。": "View this session's tasks, progress and results.",
+  "查看待处理": "View pending files",
+  "查看结果": "View results",
+  "查看来源": "View source",
+  "查看任务": "View tasks",
+  "查看文件处理失败的原因": "View why file processing failed",
+  "查看原因": "View details",
+  "常用功能": "Common actions",
+  "常用密码推测": "Common password guesses",
+  "常用数字 · 仅本次会话": "Common numbers · This session only",
+  "常用数字最多保存 100 条。": "You can keep up to 100 common numbers.",
+  "超过任一上限会停止解压并清理本次临时内容；1 GiB = 1,073,741,824 字节。": "Extraction stops and temporary data is cleaned up if any limit is exceeded. 1 GiB = 1,073,741,824 bytes.",
+  "超小": "Tiny",
+  "彻底退出": "Exit completely",
+  "程序|*.exe": "Applications|*.exe",
+  "程序遇到了无法继续的问题，将安全退出。已完成的文件仍会保留。\n\n请重新启动。诊断记录：{0}\n日志位置：{1}": "The app encountered a problem and will exit safely. Completed files will be kept.\n\nPlease restart the app. Diagnostic record: {0}\nLog location: {1}",
+  "持续轻柔": "Gentle motion",
+  "持续轻柔会保持猫咪的呼吸与动作；跟随 Windows 按系统动画设置播放；减少动效保留静态表情与文字反馈。此选项只影响桌宠。": "Gentle motion keeps the cat breathing and moving. Follow Windows uses system animation settings. Reduced motion keeps still expressions and text feedback. This only affects the desktop pet.",
+  "处理": "Process",
+  "处理次数": "Passes",
+  "处理未完成。": "Processing did not finish.",
+  "处理文件": "Process files",
+  "处理中": "Processing",
+  "处理中 · {0}/{1}": "Processing · {0}/{1}",
+  "处理中 {0:0}%": "Processing {0:0}%",
+  "窗口化游戏列表": "Windowed games",
+  "此压缩包包含不安全的条目，请使用可信来源的压缩包。": "This archive contains unsafe entries. Use an archive from a trusted source.",
+  "此压缩包可以直接解压。": "This archive can be extracted directly.",
+  "此压缩包没有密码加密。": "This archive is not password-protected.",
+  "此压缩包需要密码。": "This archive needs a password.",
+  "从视频中提取音轨，保存为独立音频文件。": "Extract audio tracks from videos and save them as separate audio files.",
+  "存储": "Store only",
+  "错误代码：{0}\n诊断记录：{1}\n\n{2}": "Error code: {0}\nDiagnostic record: {1}\n\n{2}",
+  "打包队列": "Archive queue",
+  "打包压缩": "Create archive",
+  "打个招呼": "Say hello",
+  "打开": "Open",
+  "打开保存位置": "Open save location",
+  "打开罐头，和猫咪分享悠闲时光。": "Open a can and share a relaxing moment with the cat.",
+  "打开结果": "Open result",
+  "打开软件": "Open app",
+  "打开所在位置": "Open file location",
+  "大": "Large",
+  "待处理": "Pending",
+  "待处理文件": "Pending files",
+  "待恢复": "Awaiting recovery",
+  "待选格式": "Choose format",
+  "待选择用途": "Choose action",
+  "戴上了{0}。": "Equipped {0}.",
+  "当前 GIF 档位": "Current GIF quality",
+  "当前归档方案": "Current archive plan",
+  "当前恢复方案": "Current recovery plan",
+  "当前任务完成后可修改引擎与解压保护。": "Engine and extraction safety settings can be changed after the current task finishes.",
+  "当前输出格式": "Current output format",
+  "当前图片方案": "Current image plan",
+  "当前选择已完成 · 档位用于后续添加的文件": "Selection completed · Quality applies to files added later",
+  "当前选择已完成 · 设置用于后续添加的文件": "Selection completed · Settings apply to files added later",
+  "当前压缩方案": "Current compression plan",
+  "当前页未开始的任务": "Pending tasks on this page",
+  "当前引擎不支持这个输出格式。": "The current engine does not support this output format.",
+  "当前正在处理文件，请完成后再添加": "Files are being processed. Add more when finished.",
+  "档位": "Quality",
+  "导入遇到问题，请查看原因或重新选择。": "Import encountered a problem. View details or select the files again.",
+  "等待": "Waiting",
+  "低": "Low",
+  "低 · ≤20%": "Low · ≤20%",
+  "低 · CPU 占用上限约 20%；实际占用可能更低。": "Low · CPU limit about 20%; actual use may be lower.",
+  "低强度": "Low intensity",
+  "点击选择文件，或将文件拖入此处": "Click to choose files, or drag files here",
+  "调整设置后再开始。": "Adjust settings before starting.",
+  "动画偏好": "Animation preference",
+  "动画时长无法安全保留。": "The animation duration cannot be safely preserved.",
+  "动画输出意外变为静态图片。": "The animated output unexpectedly became a still image.",
+  "动画循环信息丢失。": "Animation loop information was lost.",
+  "动画帧数过多。": "There are too many animation frames.",
+  "动态 WebP · 保留动画": "Animated WebP · Keep animation",
+  "逗猫棒": "Cat wand",
+  "读取图片信息超过了时间限制。": "Reading image information timed out.",
+  "读取文件或保存结果时遇到了问题。": "A problem occurred while reading files or saving results.",
+  "读取像素": "Read pixels",
+  "读取压缩包": "Read archive",
+  "读取压缩包时遇到了问题。": "A problem occurred while reading the archive.",
+  "读取这个文件花了太长时间。": "Reading this file took too long.",
+  "读取这张图片花了太长时间。": "Reading this image took too long.",
+  "队列包含加密压缩包，请填写解压密码或为该项设置密码。": "The queue contains encrypted archives. Enter a batch password or set a password for each archive.",
+  "方案 / 结果": "Plan / Result",
+  "方案 / 文件信息": "Plan / File details",
+  "方块": "Blocks",
+  "方块图片模式": "Block image mode",
+  "放这里就可以啦！": "Drop them right here!",
+  "分别打包": "Archive separately",
+  "分卷数量超过 10000 卷。": "The number of volumes exceeds 10,000.",
+  "分卷重组校验失败。": "Volume reassembly verification failed.",
+  "复制": "Copy",
+  "复制恢复的密码": "Copy recovered password",
+  "复制密码": "Copy password",
+  "复制失败，请重试": "Copy failed. Try again.",
+  "复制诊断信息": "Copy diagnostic details",
+  "改用 CPU 破解": "Switch to CPU search",
+  "改用CPU破解": "Switch to CPU search",
+  "刚才完成 {0} 项": "Just completed {0} items",
+  "高": "High",
+  "高 · ≤80%": "High · ≤80%",
+  "高 · CPU 占用上限约 80%；实际占用可能更低。": "High · CPU limit about 80%; actual use may be lower.",
+  "高级：密码与分卷": "Advanced: Password and volumes",
+  "高级：压缩包引擎与解压保护": "Advanced: Archive engine and extraction safety",
+  "高级：转换引擎位置": "Advanced: Conversion engine location",
+  "高级详情": "Advanced details",
+  "高强度": "High intensity",
+  "高压缩": "High compression",
+  "搞定啦！": "All done!",
+  "格式": "Format",
+  "格式、图片混淆模式和次数、压缩方案、GIF 档位、打包设置与保存位置会自动记住；密码不会保存。": "Formats, image obfuscation mode and passes, compression plans, GIF quality, archive settings and save locations are remembered automatically. Passwords are never saved.",
+  "格式预设标识为空或重复。": "Format preset IDs are empty or duplicated.",
+  "格式预设内容无效。": "The format preset is invalid.",
+  "格式预设文件为空。": "The format preset file is empty.",
+  "格式转换": "Format conversion",
+  "给猫咪戴上小铃铛，可随时卸下。": "A little bell collar for the cat. Remove it whenever you like.",
+  "跟随 Windows": "Follow Windows",
+  "跟随系统": "Follow system",
+  "更多工具": "More tools",
+  "更省空间": "Save more space",
+  "工作进度已保存。": "Work progress saved.",
+  "购买": "Buy",
+  "关": "Off",
+  "关闭": "Close",
+  "关于": "About",
+  "管理常用数字": "Manage common numbers",
+  "罐头": "Canned food",
+  "归档操作未完成 · 可以查看原因": "Archive action incomplete · View details",
+  "归档操作未完成；为保护密码，不记录异常参数。": "Archive action incomplete. Exception arguments are not logged to protect passwords.",
+  "归档操作遇到了问题。": "An archive action encountered a problem.",
+  "归档界面通知失败；密码不写入诊断。": "Archive UI notification failed. Passwords are excluded from diagnostics.",
+  "归档密码": "Archive password",
+  "归档输入检查已停止": "Archive input checking stopped",
+  "归档压缩档位": "Archive compression level",
+  "还没放进背包": "Not in your inventory yet",
+  "还没有待选文件，拖到猫咪身上或从这里添加。": "No pending files yet. Drop files on the cat or add them here.",
+  "还有 {0} 个文件需要选择输出格式": "{0} files still need an output format",
+  "还有 {0} 项待选择或检查，可在桌宠页查看。": "{0} items still need an action or review. See the pet page.",
+  "还有 {0} 项留在首页，可选择其他用途或查看原因。": "{0} items remain on Home. Choose another action or view details.",
+  "还有文件正在处理": "Files are still being processed",
+  "合并成一个包": "Combine into one archive",
+  "合并打包": "Combine inputs",
+  "合并为一个压缩包": "Combine into a single archive",
+  "和猫咪待一会儿": "Spend a moment with the cat",
+  "候选曾通过局部校验；全包校验失败，可能存在损坏或不同条目密码。": "A candidate passed a partial check but failed full archive verification. Data may be damaged or entries may use different passwords.",
+  "候选已测试完成，暂时没有找到密码。": "All candidates have been tested. No password was found.",
+  "候选已耗尽 · 可改用 CPU 破解": "Candidates exhausted · Switch to CPU search",
+  "候选已耗尽 · 未找到": "Candidates exhausted · Not found",
+  "呼噜呼噜……再摸一下吧。": "Purr purr… one more pet, please.",
+  "喵～摸摸头，烦恼都溜走啦。": "Meow~ Head pats make my worries melt away.",
+  "这个力度刚刚好，呼噜～": "That's just the right touch. Purr~",
+  "好舒服呀，再陪我一会儿吧。": "That feels lovely. Stay with me a little longer.",
+  "今天的摸摸头，我收下啦！": "Your head pats just made my day!",
+  "有你在身边，猫猫好安心。": "I feel so safe with you by my side.",
+  "互动": "Interact",
+  "欢迎回来喵！猫咪已经准备好啦。": "Welcome back, meow! Your cat is ready.",
+  "恢复4位数字密码": "Recover a 4-digit password",
+  "恢复6位数字密码": "Recover a 6-digit password",
+  "恢复成功 · 全包校验通过": "Recovered · Full archive verified",
+  "恢复候选须为去重后的指定长度纯数字密码。": "Recovery candidates must be unique numeric passwords of the selected length.",
+  "恢复候选总数": "Total recovery candidates",
+  "恢复界面通知失败；候选和密码不写入诊断。": "Recovery UI notification failed. Candidates and passwords are excluded from diagnostics.",
+  "恢复内置引擎": "Restore bundled engine",
+  "恢复设置或常用数字无效。": "Recovery settings or common numbers are invalid.",
+  "恢复未完成 · 可以查看原因": "Recovery incomplete · View details",
+  "会话未激活": "Session inactive",
+  "或者点击这里选择文件": "Or click here to choose files",
+  "及后续添加；自动识别的恢复参数保持不变。": "and files added later. Auto-detected restoration settings stay unchanged.",
+  "极低": "Very low",
+  "计算强度": "Compute intensity",
+  "继续处理": "Keep processing",
+  "继续处理，或停止当前任务后退出。原文件会保留，未完成的临时文件会清理。": "Keep processing, or stop the current task and exit. Original files are kept and incomplete temporary files are cleaned up.",
+  "减少 {0:0.#}%": "Reduced {0:0.#}%",
+  "减少动效": "Reduced motion",
+  "剪贴板暂时不可用，请稍后再复制。": "The clipboard is unavailable. Try copying again later.",
+  "剪贴板暂时不可用，请稍后重试，或粘贴到上方输入框。": "The clipboard is unavailable. Try again later or paste into the box above.",
+  "检查图片": "Check image",
+  "检查压缩包": "Check archive",
+  "建议在高算力计算机上使用，6 位密码最多需测试 1,000,000 个组合。": "A powerful computer is recommended. A 6-digit password may require testing up to 1,000,000 combinations.",
+  "奖励还在等待保存，保存成功后再进行背包交易。": "Rewards are waiting to be saved. Inventory transactions are available after saving succeeds.",
+  "奖励已保存。": "Rewards saved.",
+  "接住的文件": "Received files",
+  "接住今天的小小好心情！": "Catch a little happiness today!",
+  "解压保护：最多 {0:N0} 个条目 · {1} 层 · {2:0.##} GiB": "Extraction safety: {0:N0} entries · {1} levels · {2:0.##} GiB maximum",
+  "解压保护设置": "Extraction safety settings",
+  "解压到独立文件夹": "Extract into separate folders",
+  "解压队列": "Extraction queue",
+  "解压后的实际数据量超过安全限额。": "The actual extracted data exceeds the safety limit.",
+  "解压缩": "Extract archive",
+  "解压文件": "Extract files",
+  "今天也陪你一起，把事情一件件完成。": "I'll be here today too, helping you finish one thing at a time.",
+  "今天也陪你一起把文件整理好。": "Let's organize your files together today.",
+  "今天也一起慢慢完成吧。": "We'll take our time and get things done together.",
+  "进度 / 剩余组合": "Progress / Remaining combinations",
+  "开罐头啦，今天好幸福。": "A can of food! What a lovely day.",
+  "开始 / 继续工作": "Start / Resume work",
+  "开始打包": "Start archiving",
+  "开始工作啦！每分钟获得 4 喵喵币，按秒累计。": "Work started! Earn 4 Meow Coins per minute, calculated by the second.",
+  "开始恢复": "Start recovery",
+  "开始混淆": "Start obfuscation",
+  "开始解混淆": "Start restoration",
+  "开始解压": "Start extraction",
+  "开始生成 GIF": "Create GIF",
+  "开始压缩": "Start compression",
+  "开始转换": "Start conversion",
+  "看看哪里出了问题": "See what went wrong",
+  "可填写小数 · 1 MB = 1,000,000 字节": "Decimals allowed · 1 MB = 1,000,000 bytes",
+  "可以直接使用解压缩功能。": "You can use Extract archive directly.",
+  "空包或无法校验的内容暂不支持密码恢复。": "Password recovery is unavailable for empty archives or data that cannot be verified.",
+  "空文件或缺少校验信息的压缩包无法可靠确认恢复密码。": "Recovered passwords cannot be reliably verified for empty archives or archives without check information.",
+  "快捷压缩": "Quick compression",
+  "快速": "Fast",
+  "累了就休息一下，我在这里。": "Take a break when you're tired. I'm here.",
+  "铃铛项圈": "Bell collar",
+  "慢慢来，事情会一件件完成的。": "Take your time. We'll finish one thing after another.",
+  "忙的时候陪你，闲的时候一起玩。": "Here while you're busy, ready to play when you're free.",
+  "猫咪": "Cat",
+  "猫咪吃到了{0}，好开心。": "The cat enjoyed {0}. So happy!",
+  "猫咪大小": "Cat size",
+  "猫咪的轻松工作": "The cat's relaxed work",
+  "猫咪的提醒": "A note from your cat",
+  "猫咪的休息角": "The cat's cozy corner",
+  "猫咪等待文件": "Cat waiting for files",
+  "猫咪还在处理文件。": "The cat is still processing files.",
+  "猫咪很开心，正在和你一起玩。": "The cat is happy to be playing with you.",
+  "猫咪就在这里，随时陪你。": "Your cat is right here, ready to keep you company.",
+  "猫咪提示文件处理成功": "Cat reports successful file processing",
+  "猫咪提示文件处理遇到问题": "Cat reports a file processing issue",
+  "猫咪显示在其他窗口上方": "Keep the cat above other windows",
+  "猫咪正在处理文件": "Cat processing files",
+  "猫咪正在散步，陪你活动一下。": "The cat is taking a walk. Stretch a little too!",
+  "猫咪正在小憩，摸摸它就会醒来。": "The cat is napping. Give it a pet to wake it up.",
+  "猫咪正在休息": "Cat resting",
+  "猫咪助手状态": "Cat assistant status",
+  "猫咪准备好了，随时开始一段轻松工作。": "The cat is ready. Start a relaxed work session whenever you like.",
+  "猫咪准备接收文件": "Cat ready to receive files",
+  "猫咪桌宠": "Desktop cat",
+  "猫咪桌宠 · 陪伴、商店与背包": "Desktop cat · Companion, shop and inventory",
+  "猫咪桌宠 · 陪伴与商店": "Desktop cat · Companion and shop",
+  "毛线球": "Yarn ball",
+  "没有从这个文件中读到图片。": "No image could be read from this file.",
+  "没有读取或保存文件的权限。": "Permission denied when reading or saving files.",
+  "没有读取压缩包的权限。": "You do not have permission to read the archive.",
+  "没有读取这个文件的权限。": "You do not have permission to read this file.",
+  "没有读取这个文件或文件夹的权限。": "You do not have permission to read this file or folder.",
+  "没有额外技术详情。": "No additional technical details.",
+  "没有饥饿惩罚，离开多久都欢迎你回来。": "No hunger penalties. You'll always be welcome back.",
+  "没有可保留文件内容的压缩格式，请移除此任务。": "No compression format can preserve this file's content. Remove this task.",
+  "没有可完整保留这个文件内容的压缩格式。": "No compression format can fully preserve this file's content.",
+  "没有权限保存转换结果。": "You do not have permission to save the converted file.",
+  "没有权限读取视频或保存 GIF。": "Permission denied when reading the video or saving the GIF.",
+  "没有权限读取图片或保存结果。": "Permission denied when reading the image or saving the result.",
+  "没有权限读取文件或保存结果。": "Permission denied when reading the file or saving the result.",
+  "没有权限读取文件或保存转换结果。": "Permission denied when reading the file or saving the converted result.",
+  "没有权限读取这张图片。": "You do not have permission to read this image.",
+  "没有生成完整的 GIF。": "A complete GIF was not created.",
+  "没有生成完整的 PNG。": "A complete PNG was not created.",
+  "没有找到内置图片处理引擎。": "The bundled image engine was not found.",
+  "没有找到内置转换引擎。": "The bundled conversion engine was not found.",
+  "没有找到完整的压缩包引擎。": "The complete archive engine was not found.",
+  "没有找到压缩包或首卷。": "The archive or first volume was not found.",
+  "没有这个配饰位置。": "This accessory slot does not exist.",
+  "每个文件 ≤ {0}": "Each file ≤ {0}",
+  "每个文件 ≤ {0} MB": "Each file ≤ {0} MB",
+  "每个文件最大": "Maximum per file",
+  "每个文件最大大小（MB）": "Maximum file size (MB)",
+  "每个压缩包解压到独立文件夹": "Extract each archive into its own folder",
+  "每个压缩包另存到独立文件夹，检查成功后再保存；保留原包。": "Extract each archive into its own folder and verify before saving. The original archive is kept.",
+  "每卷 1–102400 MiB；1 MiB = 1,048,576 字节，最后一卷可更小": "1–102400 MiB per volume; 1 MiB = 1,048,576 bytes. The last volume can be smaller.",
+  "每卷大小需为 1–102400 MiB（最多 100 GiB，可带小数）。": "Volume size must be 1–102400 MiB (up to 100 GiB; decimals allowed).",
+  "每卷大小MiB": "Volume size (MiB)",
+  "每条常用数字须为 1–20 个数字（0–9）。": "Each common number must contain 1–20 digits (0–9).",
+  "每条须为 1–20 个数字（0–9），合并重复项后最多 100 条。": "Use 1–20 digits (0–9) per entry, with up to 100 unique entries.",
+  "每项分别打包": "Create a separate archive for each input",
+  "每行一条，可逐行粘贴。每条 1–20 个数字（0–9），最多 100 条，重复项自动合并，保留前导零。退出软件后清空。": "One entry per line, 1–20 digits (0–9) each, up to 100 entries. Duplicates are merged and leading zeros kept. Cleared when you exit the app.",
+  "密码": "Password",
+  "密码 / 操作": "Password / Actions",
+  "密码：{0}": "Password: {0}",
+  "密码不能包含换行或空字符。": "Passwords cannot contain line breaks or null characters.",
+  "密码不能为空、超过 1024 个字符或包含换行及空字符。": "Passwords must contain 1–1,024 characters, without line breaks or null characters.",
+  "密码错误或加密数据已损坏。": "The password is wrong or the encrypted data is damaged.",
+  "密码恢复": "Password recovery",
+  "密码恢复低强度CPU上限20%": "Password recovery low intensity, CPU limit 20%",
+  "密码恢复队列": "Password recovery queue",
+  "密码恢复高强度CPU上限80%": "Password recovery high intensity, CPU limit 80%",
+  "密码恢复仅支持有效的 ZIP、7Z 和 RAR 压缩包。": "Password recovery only supports valid ZIP, 7Z and RAR archives.",
+  "密码恢复任务列表": "Password recovery tasks",
+  "密码恢复所需内存超过安全限额。": "The memory required for password recovery exceeds the safety limit.",
+  "密码恢复未能完成。": "Password recovery could not finish.",
+  "密码恢复未完成；候选和恢复结果不写入诊断。": "Password recovery incomplete. Candidates and recovered results are excluded from diagnostics.",
+  "密码恢复位数、分片或计算强度无效。": "The recovery digit count, shard or compute intensity is invalid.",
+  "密码恢复已取消。": "Password recovery cancelled.",
+  "密码恢复引擎不完整。": "The password recovery engine is incomplete.",
+  "密码恢复引擎未能完成任务。": "The password recovery engine could not finish the task.",
+  "密码恢复遇到了问题，请打开软件查看原因。": "Password recovery encountered a problem. Open the app for details.",
+  "密码恢复遇到了问题。": "Password recovery encountered a problem.",
+  "密码恢复支持 ZIP、7z 和 RAR。": "Password recovery supports ZIP, 7z and RAR.",
+  "密码恢复中强度CPU上限50%": "Password recovery medium intensity, CPU limit 50%",
+  "密码缺失、错误或加密头已损坏。": "The password is missing or wrong, or the encrypted header is damaged.",
+  "密码位数": "Password digits",
+  "密码已用于本次解压 · 点击开始解压": "Password applied to this extraction · Click Start extraction",
+  "喵～有文件需要我帮忙吗？": "Meow! Any files I can help with?",
+  "喵喵币还不够，可以一起处理文件或休闲工作。": "Not enough Meow Coins yet. Process files together or start relaxed work.",
+  "喵喵币余额已达到上限，奖励等待保存。": "The Meow Coin balance limit has been reached. Rewards are waiting to be saved.",
+  "喵喵商店": "Meow Shop",
+  "摸摸猫咪": "Pet the cat",
+  "摸摸猫咪 · 也可以按 Enter 或空格": "Pet the cat · You can also press Enter or Space",
+  "摸摸头": "Pat the cat's head",
+  "摸摸头，玩一下。每个小动作都有回应。": "A little pet, a little play. Every small gesture gets a response.",
+  "目录": "Folder",
+  "内置转换引擎已就绪": "Bundled conversion engine ready",
+  "你的猫咪文件助手": "Your Cat File Assistant",
+  "你的猫咪文件助手 · {0}\n双击打开，右键管理桌宠": "Your Cat File Assistant · {0}\nDouble-click to open; right-click to manage your pet",
+  "你的猫咪文件助手 · 轻松处理，安心留存。": "Your Cat File Assistant · Easy processing, originals kept safe.",
+  "你的猫咪桌宠": "Your desktop cat",
+  "你来啦，今天要做什么呢？": "You're here! What shall we do today?",
+  "你来了，我的尾巴都开心起来啦。": "You're here, and even my tail is happy!",
+  "偶尔在桌面走动": "Occasionally roam the desktop",
+  "陪伴互动": "Companion",
+  "陪伴累计 5 分钟可获得 20 喵喵币。处理文件、隐藏或游戏时暂停，不消耗额外计算资源。": "Earn 20 Meow Coins for 5 minutes of companionship. Pauses during file processing, hiding or games, without extra computation.",
+  "陪你玩一小会儿，喵～": "Let's play for a moment, meow!",
+  "配饰收回背包啦。": "Accessory returned to your inventory.",
+  "启用7Z分卷": "Enable split 7Z archive",
+  "启用归档密码": "Enable archive password",
+  "启用桌面猫咪": "Enable desktop cat",
+  "浅色": "Light",
+  "轻松工作": "Relaxed work",
+  "轻松工作已暂停": "Relaxed work paused",
+  "轻松工作中": "Working",
+  "清空": "Clear",
+  "清空待选": "Clear pending files",
+  "清空转换队列": "Clear conversion queue",
+  "请把图片复制到普通本机文件夹后重试。": "Copy the image to a regular local folder and try again.",
+  "请把文件复制到你的文档或视频文件夹后重试。": "Copy the file to your Documents or Videos folder and try again.",
+  "请把最大大小调大一些，或选择更高效的格式。本次最小结果约为 {0:0.###} MB。": "Increase the maximum size or choose a more efficient format. The smallest result was about {0:0.###} MB.",
+  "请补齐全部分卷后重试。": "Collect every volume and try again.",
+  "请尝试其他输出格式；原文件保持不变。": "Try another output format. The original file is kept unchanged.",
+  "请尝试其他输出格式。": "Try another output format.",
+  "请尝试其他文件，或在设置中检查转换引擎。": "Try another file or check the conversion engine in Settings.",
+  "请从背包选择小鱼干或罐头。": "Choose dried fish or canned food from your inventory.",
+  "请等待其他程序保存完成后重试。": "Wait for the other program to finish saving, then try again.",
+  "请调大大小或更换兼容格式。": "Increase the size limit or choose a compatible format.",
+  "请调大目标大小，或选择其他兼容格式；原文件保持不变。": "Increase the target size or choose another compatible format. The original file is kept unchanged.",
+  "请复制到有读写权限的文件夹后重试。": "Copy it to a folder with read and write permission and try again.",
+  "请改用高档或更低的档位；原视频保持不变。": "Choose High or a lower quality level. The original video is kept unchanged.",
+  "请更改名称或选择其他输出文件夹。": "Change the name or choose another output folder.",
+  "请换到文档或视频文件夹等有写入权限的位置。": "Choose a writable location, such as your Documents or Videos folder.",
+  "请换一个具有完整时间信息的视频。": "Choose a video with complete timing information.",
+  "请换一个文件重试。": "Try another file.",
+  "请减少处理次数或换一张较小的图片。": "Use fewer passes or a smaller image.",
+  "请检查磁盘空间、文件占用和保存位置，然后重试。": "Check disk space, files in use and the save location, then try again.",
+  "请检查磁盘空间和保存位置。": "Check disk space and the save location.",
+  "请检查磁盘剩余空间、文件占用情况和保存位置，再重试。": "Check free disk space, files in use and the save location, then try again.",
+  "请检查读取权限、文件占用和分卷完整性。": "Check read permissions, files in use and whether every volume is complete.",
+  "请检查密码、补齐分卷，或重新取得完整压缩包。": "Check the password, collect missing volumes or obtain a complete archive again.",
+  "请检查密码、压缩包完整性和分卷文件。": "Check the password, archive integrity and volume files.",
+  "请检查密码和压缩包完整性，并确保分卷齐全。": "Check the password and archive integrity, and ensure every volume is present.",
+  "请检查文件和保存位置，然后重试。": "Check the file and save location, then try again.",
+  "请检查文件权限、磁盘剩余空间和压缩包完整性。": "Check file permissions, free disk space and archive integrity.",
+  "请检查文件是否被占用、所有分卷是否齐全。": "Check whether files are in use and every volume is present.",
+  "请检查文件是否完整、是否被其他程序占用，然后重新选择。": "Check that the file is complete and not in use, then select it again.",
+  "请检查文件是否完整、所有分卷是否齐全，以及保存位置的剩余空间。": "Check file integrity, all volumes and free space at the save location.",
+  "请检查文件与输出位置后重试。": "Check the files and output location, then try again.",
+  "请检查文件占用、磁盘空间和保存位置。": "Check files in use, disk space and the save location.",
+  "请检查文件占用、剩余空间和保存位置。": "Check files in use, free space and the save location.",
+  "请检查文件占用和磁盘空间后重试。": "Check files in use and disk space, then try again.",
+  "请检查文件占用和所有分卷是否完整。": "Check files in use and whether every volume is complete.",
+  "请检查文件占用和文件是否完整，然后重新选择。": "Check files in use and file integrity, then select the file again.",
+  "请检查压缩包格式、完整性和所有分卷。": "Check the archive format, integrity and all volumes.",
+  "请检查压缩包和可用内存后重试。": "Check the archive and available memory, then try again.",
+  "请检查压缩包及设置中的限额。": "Check the archive and the limits in Settings.",
+  "请检查压缩包完整性。": "Check archive integrity.",
+  "请检查压缩包完整性和可用内存后重试。": "Check archive integrity and available memory, then try again.",
+  "请检查压缩包完整性和所有分卷。": "Check archive integrity and all volumes.",
+  "请检查压缩包完整性和压缩引擎。": "Check archive integrity and the archive engine.",
+  "请检查压缩包完整性和引擎兼容性。": "Check archive integrity and engine compatibility.",
+  "请将全部分卷放在同一文件夹，从 .001 开始打开。": "Place every volume in the same folder and open the .001 file first.",
+  "请将所有分卷放在同一文件夹，再选择首卷。": "Place every volume in the same folder, then select the first volume.",
+  "请将图片复制到本机磁盘后重试。": "Copy the image to a local disk and try again.",
+  "请将完整压缩包放到有读取权限的位置。": "Put the complete archive in a location you can read.",
+  "请将完整压缩包复制到有读取权限的位置。": "Copy the complete archive to a location you can read.",
+  "请将文件复制到本机磁盘，确认能正常打开后再试。": "Copy the file to a local disk, check that it opens, then try again.",
+  "请降低计算强度或使用内存更充足的计算机。": "Lower the compute intensity or use a computer with more memory.",
+  "请切换到对应的视频、音频或图片转换功能。": "Switch to the matching video, audio or image conversion tool.",
+  "请清理磁盘或选择空间更充足的保存位置。": "Free disk space or choose a save location with more space.",
+  "请确认保存位置可用，重试此任务。": "Check that the save location is available and retry this task.",
+  "请确认视频可以正常播放，或换一个视频。": "Check that the video plays correctly or choose another video.",
+  "请确认视频可以正常播放，然后重试。": "Check that the video plays correctly, then try again.",
+  "请确认视频文件完整并可以正常播放。": "Check that the video is complete and plays correctly.",
+  "请确认输入存在、可以读取，分卷文件在同一文件夹。": "Check that the inputs exist and are readable, with volume files in the same folder.",
+  "请确认所有分卷位于同一个文件夹，再选择首卷。": "Check that every volume is in the same folder, then select the first volume.",
+  "请确认图片可读取、格式受支持且未损坏。动图不支持；原文件保持不变。": "Check that the image is readable, supported and undamaged. Animated images are unsupported. The original file is kept unchanged.",
+  "请确认图片可以正常打开，或尝试常见的 JPG、PNG 格式。": "Check that the image opens correctly or try JPG or PNG.",
+  "请确认图片完整，且可以正常打开。": "Check that the image is complete and opens correctly.",
+  "请确认图片完整，且软件包包含内置图片引擎。": "Check that the image is complete and the app includes its image engine.",
+  "请确认图片完整后重试；可以查看高级详情。": "Check image integrity and try again. Advanced details are available.",
+  "请确认图片完整后重试。": "Check image integrity and try again.",
+  "请确认图片完整且可以正常打开。": "Check that the image is complete and opens correctly.",
+  "请确认文件可读取，并重试。": "Check that the file is readable and try again.",
+  "请确认文件可以正常播放，然后重试。": "Check that the file plays correctly, then try again.",
+  "请确认文件类型适合当前功能，并且文件能够正常打开。": "Check that this tool supports the file type and the file opens correctly.",
+  "请确认压缩包和分卷完整。": "Check that the archive and every volume are complete.",
+  "请确认压缩包和所有分卷都保留在同一个文件夹中。": "Keep the archive and every volume in the same folder.",
+  "请确认压缩包可读取后重试。": "Check that the archive is readable and try again.",
+  "请确认压缩包已加密且可读取，分卷文件位于同一目录。": "Check that the archive is encrypted and readable, with all volumes in the same folder.",
+  "请确认引擎、文件和保存位置可用，然后重试。": "Check that the engine, files and save location are available, then try again.",
+  "请确认引擎和压缩包可读取，然后重试。": "Check that the engine and archive are readable, then try again.",
+  "请确认原文件可以正常播放或打开，再尝试其他输出格式。": "Check that the original file plays or opens correctly, then try another output format.",
+  "请确认原文件可以正常打开，并尝试其他输出格式。": "Check that the original file opens correctly and try another output format.",
+  "请确认原文件完整并可以正常播放。": "Check that the original file is complete and plays correctly.",
+  "请使用不超过 240 个字符的普通名称，不能使用 CON、COM1 等系统保留名称。": "Use a regular name of up to 240 characters. System-reserved names such as CON and COM1 are not allowed.",
+  "请使用创建此文件的工具检查压缩包。": "Check the archive using the tool that created it.",
+  "请使用其他文件；原文件会保留。动画、透明区域、音轨和字幕不会静默丢弃。": "Use another file. Original files are kept; animation, transparency, audio tracks and subtitles are never silently discarded.",
+  "请使用软件包内的完整转换引擎，或选择其他格式。": "Use the app's complete bundled conversion engine or choose another format.",
+  "请使用完整且未经修改的图片。": "Use a complete, unmodified image.",
+  "请使用英文字母、数字和英文符号；Unicode 密码可选择 7z 格式。": "Use English letters, numbers and ASCII symbols. Choose 7z for Unicode passwords.",
+  "请使用原始图片，不要仅修改文件扩展名。": "Use the original image rather than changing only its extension.",
+  "请使用支持此算法的压缩软件。": "Use archive software that supports this algorithm.",
+  "请输入 1–20 位纯数字，前导零会保留。": "Enter 1–20 digits. Leading zeros are kept.",
+  "请输入大于 0 的 MB 数字（可带小数）。": "Enter a number greater than 0 in MB; decimals are allowed.",
+  "请输入数字；多条数字请每行一条。": "Enter digits, with one number per line for multiple entries.",
+  "请输入压缩包密码后重试。": "Enter the archive password and try again.",
+  "请输入有效的压缩包名称。": "Enter a valid archive name.",
+  "请缩小解压范围，或在设置中调整安全限额。": "Extract fewer files or adjust the safety limits in Settings.",
+  "请填写大于 0 的条目数、目录层数和解压总量。": "Enter positive limits for entry count, folder depth and total extracted size.",
+  "请填写大于零的安全上限。": "Enter positive safety limits.",
+  "请填写密码，或关闭密码选项。": "Enter a password or turn off password protection.",
+  "请填写一个正数，单位为 MB。": "Enter a positive number in MB.",
+  "请填写有效的压缩包名称（无需扩展名）。": "Enter a valid archive name without an extension.",
+  "请完整解压 V0.6 软件包。": "Reinstall the complete app.",
+  "请完整解压软件包，保留 worker 文件夹及 tools/7zip/bin/7z.dll；也可在设置中选择兼容的 DLL。": "Reinstall the app with its complete archive worker and 7-Zip engine, or select a compatible DLL in Settings.",
+  "请完整解压软件包，确保 tools/ffmpeg/bin 文件夹与程序一起保留。": "Reinstall the app with its complete FFmpeg engine.",
+  "请完整解压软件包；不要单独移动 EXE 或删除引擎文件夹。": "Keep the complete installed app together. Do not move only the EXE or remove engine folders.",
+  "请完整解压软件包；在设置中检查引擎文件夹。": "Reinstall the complete app and check the engine folder in Settings.",
+  "请完整解压软件包。": "Reinstall the complete app.",
+  "请完整解压软件包并保留 tools/ffmpeg/bin 文件夹。": "Reinstall the app with its complete FFmpeg engine.",
+  "请完整解压软件包并检查引擎 DLL。": "Reinstall the complete app and check the engine DLL.",
+  "请先导出为 GIF 或动态 WebP，避免只保存第一帧。": "Export as GIF or animated WebP first to avoid saving only the first frame.",
+  "请先检查压缩包完整性。": "Check archive integrity first.",
+  "请先解混淆；需要多次处理时，请直接设置混淆次数。": "Restore the image first. For repeated processing, set the number of obfuscation passes directly.",
+  "请先确认文件可以播放或打开；如果文件未下载完整，请重新下载。": "Check that the file plays or opens. Download it again if the download is incomplete.",
+  "请先添加文件或文件夹。": "Add files or folders first.",
+  "请先停止当前任务。": "Stop the current task first.",
+  "请先在图片解混淆页恢复，再对恢复后的图片重新混淆。": "Restore the image on the Restore image page first, then obfuscate the restored image again.",
+  "请选择 4 位或 6 位纯数字密码。": "Choose a 4- or 6-digit numeric password.",
+  "请选择 4／6 位，常用数字须为每条 1–20 个数字，最多 100 条。": "Choose 4 or 6 digits. Each common number must contain 1–20 digits, up to 100 entries.",
+  "请选择 7Z 和有效的分卷大小。": "Choose 7Z and a valid volume size.",
+  "请选择 JPG、PNG、BMP 或静态 WebP。": "Choose JPG, PNG, BMP or still WebP.",
+  "请选择 ZIP、7Z 或 RAR 压缩包。": "Choose a ZIP, 7Z or RAR archive.",
+  "请选择 ZIP、7Z、RAR、TAR、GZ、BZ2、XZ 或相应分卷。": "Choose ZIP, 7Z, RAR, TAR, GZ, BZ2, XZ or their volumes.",
+  "请选择包含 ffmpeg.exe 和 ffprobe.exe 的引擎文件夹。": "Choose the engine folder containing ffmpeg.exe and ffprobe.exe.",
+  "请选择包含视频画面的文件。": "Choose a file containing video frames.",
+  "请选择保存文件夹。": "Choose a save folder.",
+  "请选择不超过 256 MiB 的完整静态图片。": "Choose a complete still image no larger than 256 MiB.",
+  "请选择此格式支持的压缩档位。": "Choose a compression level supported by this format.",
+  "请选择带声音的视频；无声视频仍可使用“视频转换”。": "Choose a video with sound. Silent videos can still use Video conversion.",
+  "请选择带声音的音频文件。": "Choose an audio file with sound.",
+  "请选择单张 JPG、PNG、BMP 或静态 WebP。": "Choose a single JPG, PNG, BMP or still WebP image.",
+  "请选择单张静态图片。": "Choose a single still image.",
+  "请选择高档或更低档位，软件会在不放大的情况下校正显示比例。": "Choose High or a lower level. The app will correct the display ratio without upscaling.",
+  "请选择更低的计算强度或更小的压缩包。": "Choose a lower compute intensity or a smaller archive.",
+  "请选择静态图片，避免只处理第一帧。": "Choose a still image to avoid processing only the first frame.",
+  "请选择静态图片。": "Choose a still image.",
+  "请选择链接指向的普通文件或文件夹。": "Choose the regular file or folder that the link points to.",
+  "请选择链接指向的普通压缩包文件。": "Choose the regular archive file that the link points to.",
+  "请选择每边不超过 8192 像素且总像素不超过 1600 万的图片。": "Choose an image up to 8192 pixels on either side and 16 million pixels in total.",
+  "请选择能够保留动画、透明度、全部音轨和字幕的格式。": "Choose a format that preserves animation, transparency, all audio tracks and subtitles.",
+  "请选择你有读取权限的本机文件或文件夹。": "Choose a local file or folder you have permission to read.",
+  "请选择你有读写权限的本机文件夹。": "Choose a local folder you can read and write.",
+  "请选择你有写入权限的文件夹，并关闭占用文件的程序。": "Choose a writable folder and close any program using the file.",
+  "请选择普通本机文件。": "Choose a regular local file.",
+  "请选择普通的本机文件或文件夹。": "Choose a regular local file or folder.",
+  "请选择其他输出文件夹或名称。": "Choose another output folder or name.",
+  "请选择软件提供的模式，次数应为 1 到 10。": "Choose a supplied mode and 1–10 passes.",
+  "请选择上述格式的压缩包或首卷。": "Choose an archive or first volume in one of the supported formats.",
+  "请选择视频、音频或图片文件。": "Choose a video, audio or image file.",
+  "请选择输出格式": "Choose output format",
+  "请选择完整的 JPG、PNG、BMP 或静态 WebP。": "Choose a complete JPG, PNG, BMP or still WebP image.",
+  "请选择压缩包。": "Choose an archive.",
+  "请选择压缩包和恢复设置。": "Choose an archive and recovery settings.",
+  "请选择有读写权限的文件夹。": "Choose a folder you can read and write.",
+  "请选择有效的 7z.dll 文件。": "Choose a valid 7z.dll file.",
+  "请选择有效的恢复方式。": "Choose a valid recovery method.",
+  "请选择有效的计算强度。": "Choose a valid compute intensity.",
+  "请选择有效的视频、音频或图片文件。": "Choose a valid video, audio or image file.",
+  "请选择有效的文件处理功能。 ": "Choose a valid file processing tool. ",
+  "请选择有写入权限的文件夹。": "Choose a writable folder.",
+  "请选择支持的静态图片。": "Choose a supported still image.",
+  "请在兼容的 Windows x64 系统上重试。": "Try again on a compatible Windows x64 system.",
+  "请在设置中调整解压保护限额。": "Adjust the extraction safety limits in Settings.",
+  "请在设置中确认内置图片处理引擎完整。": "Check the bundled image engine in Settings.",
+  "请在设置中确认压缩包引擎已就绪。": "Check that the archive engine is ready in Settings.",
+  "请在这个文件的格式选项中选择一个兼容的输出格式。": "Choose a compatible output format in this file's format options.",
+  "请至少选择一个文件或文件夹。": "Choose at least one file or folder.",
+  "请重试，或换一种输出格式。": "Try again or choose another output format.",
+  "请重试；原视频保持不变。": "Try again. The original video is kept unchanged.",
+  "请重试；原图片保持不变。": "Try again. The original image is kept unchanged.",
+  "请重试；诊断记录不包含密码。": "Try again. Diagnostic records do not include passwords.",
+  "请重试。若问题持续，请打开高级详情并保存诊断信息。": "Try again. If the problem continues, open Advanced details and save the diagnostic information.",
+  "请重试或换一个视频；可以在高级详情中查看诊断记录。": "Try again or choose another video. Diagnostic records are available in Advanced details.",
+  "请重试或换一种输出格式；可以在高级详情中查看诊断记录。": "Try again or choose another output format. Diagnostic records are available in Advanced details.",
+  "请重试或选择其他档位；原视频保持不变。": "Try again or choose another quality level. The original video is kept unchanged.",
+  "请重新安装附带完整 7-Zip 引擎的应用。": "Reinstall the app with the complete 7-Zip engine.",
+  "请重新安装完整应用。": "Reinstall the complete app.",
+  "请重新添加这个文件再试。": "Add this file again and retry.",
+  "请重新选择 GIF 档位；视频转 GIF 与文件压缩不能同时使用。": "Choose GIF quality again. Video-to-GIF and file compression cannot be combined.",
+  "请重新选择软件提供的输出格式。": "Select one of the app's output formats again.",
+  "请重新选择文件；拖入文件夹时，请先打开文件夹选择其中的文件。": "Select the file again. Open folders first and choose the files inside them.",
+  "请重新选择文件。": "Select the file again.",
+  "请重新选择文件或文件夹。": "Select the file or folder again.",
+  "请重新选择文件与保存位置。": "Select the files and save location again.",
+  "请重新选择压缩包。": "Select the archive again.",
+  "请重新选择压缩模式。": "Select compression mode again.",
+  "取消": "Cancel",
+  "取消本次": "Cancel this action",
+  "全部会话任务列表": "All tasks in this session",
+  "全部状态": "All statuses",
+  "全屏、演示及指定游戏时自动隐藏": "Hide during fullscreen apps, presentations and selected games",
+  "全屏应用": "Fullscreen app",
+  "全像素": "All pixels",
+  "全像素图片模式": "All-pixel image mode",
+  "缺少密码恢复设置。": "Password recovery settings are missing.",
+  "任务不支持符号链接、目录联接或设备文件。": "This task does not support symbolic links, junctions or device files.",
+  "任务结束后清空": "Cleared after tasks finish",
+  "任务中心": "Task center",
+  "任务状态筛选": "Filter task status",
+  "任意文件、文件夹可以一起拖入": "Drop any files and folders together",
+  "任意文件与文件夹无损打包；选择格式、压缩档位和保存位置。": "Archive files and folders without loss. Choose a format, compression level and save location.",
+  "日常均衡": "Balanced",
+  "软件已经包含转换引擎，通常无需修改。": "The conversion engine is included. Changes are usually unnecessary.",
+  "删除选中": "Delete selected",
+  "商店里没有这件物品。": "This item is not in the shop.",
+  "商店与背包": "Shop and inventory",
+  "上方密码用于本批次；可在队列中为每个包单独设置密码。分卷请保留同目录的全部文件。": "The password above applies to this batch. Set individual archive passwords in the queue. Keep every volume in the same folder.",
+  "设置": "Settings",
+  "设置会自动保存在本机。关闭主窗口后继续陪伴；彻底退出请使用托盘菜单。": "Settings are saved locally. Your cat stays when the main window closes. Use the tray menu to exit completely.",
+  "设置解压密码": "Set extraction password",
+  "设置密码": "Set password",
+  "设置已保存。": "Settings saved.",
+  "伸个懒腰，再继续吧。": "Have a stretch, then carry on.",
+  "深色": "Dark",
+  "生成 GIF": "Create GIF",
+  "生成 GIF ·": "Create GIF ·",
+  "生成的 GIF 没有通过完整读取检查。": "The generated GIF failed a full read check.",
+  "生成的 GIF 没有完整保留预期画面。": "The generated GIF did not preserve all expected frames.",
+  "生成的 PNG 没有通过格式校验。": "The generated PNG failed format verification.",
+  "生成的 PNG 像素没有通过无损校验。": "The generated PNG failed lossless pixel verification.",
+  "生成的文件没有通过 GIF 格式检查。": "The generated file failed GIF format verification.",
+  "生成的文件没有通过格式检查。": "The generated file failed format verification.",
+  "生成分卷": "Create volumes",
+  "声明的解压大小超过安全限额。": "The declared extracted size exceeds the safety limit.",
+  "失败": "Failed",
+  "使用": "Use",
+  "使用此密码解压": "Extract with this password",
+  "视频 · 图片（含动图） · 音频": "Video · Images (including animation) · Audio",
+  "视频、图片、音频可以一起拖入": "Drop videos, images and audio together",
+  "视频、图片和音频，压小一份，原文件安心留存。": "Make videos, images and audio smaller while keeping the originals safe.",
+  "视频、音频和图片，选好格式就可以开始。": "Choose a format to start processing videos, audio and images.",
+  "视频读取或 GIF 保存遇到了问题。": "A problem occurred while reading the video or saving the GIF.",
+  "视频转 GIF": "Video to GIF",
+  "视频转 GIF 设置无效。": "Video-to-GIF settings are invalid.",
+  "视频转换": "Video conversion",
+  "收到了 {0:0.##} 喵喵币，谢谢你和猫咪一起努力。": "Received {0:0.##} Meow Coins. Thanks for working together with your cat!",
+  "首页": "Home",
+  "首页待选择用途文件列表": "Home files awaiting an action",
+  "首页猫咪陪伴区": "Home cat companion area",
+  "首页选择或拖入文件": "Choose or drop files on Home",
+  "输出 GIF · 无限循环 · 不含音频": "GIF output · Infinite loop · No audio",
+  "输出不超过原文件的15% · 体积优先": "Output ≤15% of original size · Smallest size",
+  "输出不超过原文件的30% · 更省空间": "Output ≤30% of original size · Save more space",
+  "输出不超过原文件的50% · 日常均衡": "Output ≤50% of original size · Balanced",
+  "输出不超过原文件的80% · 保留更多细节": "Output ≤80% of original size · Keep more detail",
+  "输出格式 / 方案": "Output format / Plan",
+  "输出目录中的同名项目过多。": "Too many items with the same name exist in the output folder.",
+  "输出体积上限：原文件的 80% / 50% / 30% / 15%。": "Output size limit: 80% / 50% / 30% / 15% of the original.",
+  "输出位置已有同名文件或文件夹。": "A file or folder with the same name exists at the output location.",
+  "输出文件夹必须为绝对路径。": "The output folder must be an absolute path.",
+  "输入": "Input",
+  "数字密码恢复范围无效。": "The numeric password recovery range is invalid.",
+  "说明": "Description",
+  "松开以接住文件，再选择处理用途": "Release to receive files, then choose an action",
+  "松开以添加文件": "Release to add files",
+  "松开以添加文件 · 不适合的项目会说明原因": "Release to add files · Unsupported items will include an explanation",
+  "搜索任务": "Search tasks",
+  "所选位数的全部数字组合已测试完 · 未找到密码": "Every numeric combination of the selected length has been tested · Password not found",
+  "所有文件|*.*": "All files|*.*",
+  "提取视频音频": "Extract video audio",
+  "提取音频": "Extract audio",
+  "体积优先": "Smallest size",
+  "添加": "Add",
+  "添加文件": "Add files",
+  "添加文件夹": "Add folder",
+  "添加游戏程序": "Add game application",
+  "填写程序名（例如 game.exe），每行一个。该程序在前台时猫咪自动休息。": "Enter one application name per line, such as game.exe. Your cat rests while that application is in the foreground.",
+  "填写压缩包名称，无需扩展名": "Enter an archive name without an extension",
+  "条目大小超过安全限额。": "The entry size exceeds the safety limit.",
+  "停止": "Stop",
+  "停止并退出": "Stop and exit",
+  "停止当前批次": "Stop current batch",
+  "停止任务": "Stop tasks",
+  "同名输出文件过多，请清理保存文件夹或更换保存位置。": "Too many output files share this name. Clean up the save folder or choose another location.",
+  "图片": "Images",
+  "图片尺寸超过了处理限制。": "The image dimensions exceed the processing limit.",
+  "图片处理超过了时间限制。": "Image processing timed out.",
+  "图片处理次数1至10": "Image processing passes, 1 to 10",
+  "图片读取或保存时遇到了问题。": "A problem occurred while reading the image or saving the result.",
+  "图片混淆": "Obfuscate image",
+  "图片混淆不提供加密保护；请仅处理有权使用的图片。": "Image obfuscation is not encryption. Only process images you have permission to use.",
+  "图片混淆参数无效。": "Image obfuscation settings are invalid.",
+  "图片混淆队列": "Image obfuscation queue",
+  "图片混淆及解混淆任务列表": "Image obfuscation and restoration tasks",
+  "图片混淆是无需密码的可逆图片排列，不提供加密保护。请仅处理有权使用的图片；无原图摘要的解混淆结果需要自行确认。": "Image obfuscation rearranges pixels reversibly without a password. It is not encryption. Only process images you have permission to use, and check restored images without an original-image digest yourself.",
+  "图片检查已停止": "Image checking stopped",
+  "图片解混淆": "Restore image",
+  "图片解混淆队列": "Image restoration queue",
+  "图片可能已被压缩、裁剪或修改，请使用未经修改的混淆 PNG。": "The image may have been compressed, cropped or edited. Use the unmodified obfuscated PNG.",
+  "图片没有通过原图像素校验。": "The image failed original pixel verification.",
+  "图片内容与文件类型不一致。": "The image content does not match the file type.",
+  "图片排列包含 BSD 2-Clause 许可的 Gilbert 曲线算法；原始版权、许可和来源见第三方组件说明。": "Image rearrangement uses the Gilbert curve algorithm under the BSD 2-Clause license. See third-party notices for original copyright, license and source.",
+  "图片数据或混淆标记不完整。": "The image data or obfuscation marker is incomplete.",
+  "图片为空、不完整或文件过大。": "The image is empty, incomplete or too large.",
+  "图片位于链接、目录联接或重解析路径中。": "The image path contains a link, junction or reparse point.",
+  "图片像素没有完整解码。": "The image pixels were not fully decoded.",
+  "图片转换": "Image conversion",
+  "退出软件": "Exit app",
+  "拖入加密 ZIP、7Z 或 RAR，分卷放在同一目录": "Drop encrypted ZIP, 7Z or RAR archives; keep volumes in one folder",
+  "拖入静态图片到这里": "Drop still images here",
+  "拖入视频到这里": "Drop videos here",
+  "拖入图片到这里": "Drop images here",
+  "拖入文件或文件夹": "Drop files or folders",
+  "拖入压缩包，分卷请放在同一文件夹": "Drop archives; keep every volume in the same folder",
+  "拖入音频到这里": "Drop audio here",
+  "外观": "Appearance",
+  "外观与动画偏好立即生效，不影响正在处理的文件。": "Appearance and animation changes apply immediately without affecting files being processed.",
+  "完成": "Done",
+  "完成 {0} 项": "Completed {0} items",
+  "完成后显示安静气泡": "Show a quiet bubble on completion",
+  "完整保留动画": "Preserve the entire animation",
+  "完整视频生成循环 GIF，选好档位即可开始；GIF 不含声音。": "Turn a whole video into a looping GIF. Choose a quality level to start. GIF has no audio.",
+  "完整校验超出了资源或解压保护限额。": "Full verification exceeded resource or extraction safety limits.",
+  "晚上好，剩下的事情我们一起慢慢来。": "Good evening. Let's take our time with what's left.",
+  "晚上好喵！今天辛苦啦。": "Good evening, meow! You've worked hard today.",
+  "未能保存日志": "Could not save the log",
+  "未提供压缩引擎路径。": "No archive engine path was provided.",
+  "未选择压缩包。": "No archive selected.",
+  "未找到压缩引擎。": "The archive engine was not found.",
+  "未找到有效的分卷文件。": "No valid volume files were found.",
+  "未知图片预设。": "Unknown image preset.",
+  "未知压缩包任务。": "Unknown archive task.",
+  "未知音频预设。": "Unknown audio preset.",
+  "喂点好吃的": "Offer a tasty treat",
+  "喂食": "Feed",
+  "文件": "File",
+  "文件 / 功能": "File / Tool",
+  "文件层级超过安全限额。": "The folder depth exceeds the safety limit.",
+  "文件打包": "Archive files",
+  "文件大小在处理时发生了变化。": "The file size changed during processing.",
+  "文件的实际数据量超过安全限额。": "The actual file data exceeds the safety limit.",
+  "文件读取或保存时遇到了问题。": "A problem occurred while reading or saving the file.",
+  "文件读取或保存遇到了问题。": "A problem occurred while reading or saving the file.",
+  "文件夹 · 包含子文件夹": "Folder · Includes subfolders",
+  "文件夹 · 打包时包含子文件夹": "Folder · Subfolders included when archiving",
+  "文件检查已停止": "File checking stopped",
+  "文件可能已移动或删除，请检查输出位置。": "The file may have been moved or deleted. Check the output location.",
+  "文件路径或归档设置无效。": "The file path or archive settings are invalid.",
+  "文件内容不会保存到桌宠存档；正式退出时清空待选列表。": "File content is not stored in the pet save. Pending selections are cleared when you exit completely.",
+  "文件压缩": "File compression",
+  "文件压缩包": "File archives",
+  "文件已加入队列，原文件不会改变。": "Files added to the queue. Original files stay unchanged.",
+  "文件已移动或不存在，请重新选择。": "The file was moved or no longer exists. Select it again.",
+  "文件已移动或无法读取，请重新选择。": "The file was moved or cannot be read. Select it again.",
+  "文件只在你的电脑中处理": "Files are processed only on your computer",
+  "文件转换、图片混淆与解混淆、压缩包处理与密码恢复都在本机完成，也不需要登录。程序保存格式、图片混淆模式和次数、压缩方案、GIF 档位、归档与恢复偏好、保存位置和本地诊断记录；常用数字和恢复密码只在内存中保留，主动清空或退出后清除。": "File conversion, image obfuscation and restoration, archives and password recovery all run locally without login. The app saves formats, image modes and passes, compression plans, GIF quality, archive and recovery preferences, save locations and local diagnostics. Common numbers and recovered passwords stay in memory only and are cleared when you clear them or exit.",
+  "我的背包": "My inventory",
+  "无": "None",
+  "无边框全屏": "Borderless fullscreen",
+  "无法初始化压缩格式。": "Could not initialize the archive format.",
+  "无法创建受限的密码恢复进程。": "Could not create a restricted password recovery process.",
+  "无法打开此压缩包或不支持其格式。": "This archive cannot be opened or its format is unsupported.",
+  "无法读取": "Cannot read",
+  "无法读取加密压缩包的头部。": "Could not read the encrypted archive header.",
+  "无法读取文件信息，请检查访问权限。": "Could not read file information. Check access permissions.",
+  "无法读取压缩包首卷，请确认分卷位于同一个文件夹。": "Could not read the first archive volume. Keep all volumes in the same folder.",
+  "无法读取压缩包首卷，请确认所有分卷位于同一个文件夹。": "Could not read the first archive volume. Check that every volume is in the same folder.",
+  "无法读取这张图片。": "Could not read this image.",
+  "无法启动图片处理引擎。": "Could not start the image engine.",
+  "无法启动压缩包引擎。": "Could not start the archive engine.",
+  "无法启动转换引擎。": "Could not start the conversion engine.",
+  "无法稳定读取压缩包。": "The archive could not be read reliably.",
+  "无密码的可逆图片排列；输出 PNG 并记录恢复参数。请保留原图，仅处理有权使用的图片。": "Reversible image rearrangement without a password. Saves PNG with restoration settings. Keep the original image and only process images you have permission to use.",
+  "无效的任务临时文件夹。": "Invalid temporary task folder.",
+  "无效的压缩安全限额。": "Invalid archive safety limits.",
+  "无效的压缩任务请求。": "Invalid archive task request.",
+  "午后的猫咪已就位，今天要做什么呢？": "Your afternoon cat is here. What shall we do today?",
+  "午间来见你啦，今天要做什么呢？": "Here to see you at midday. What shall we do today?",
+  "下午好，累了就和我一起歇一会儿。": "Good afternoon. Take a break with me if you're tired.",
+  "下午好喵！我来陪你把事情一件件完成。": "Good afternoon, meow! Let's get things done one at a time.",
+  "先从商店买好这件配饰吧。": "Buy this accessory from the shop first.",
+  "先打包为 TAR，再使用 GZip 压缩；不支持归档密码和分卷。": "Create a TAR archive, then compress it with GZip. Passwords and split volumes are unsupported.",
+  "先陪你把文件处理好，稍后再玩～": "Let's finish your files first. We can play afterwards!",
+  "先添加文件，再选择处理用途。": "Add files first, then choose an action.",
+  "显示 / 隐藏猫咪": "Show / Hide cat",
+  "现在没有正在进行的工作。": "No work session is running.",
+  "想怎样处理这些文件？": "How would you like to process these files?",
+  "向下还原": "Restore down",
+  "小": "Small",
+  "小鱼干": "Dried fish",
+  "小鱼干真香，喵～": "Dried fish smells so good, meow!",
+  "小羽毛，别跑～": "Little feather, come back!",
+  "校验输出像素": "Verify output pixels",
+  "校准大小 · 第 {0} 轮": "Adjusting size · Pass {0}",
+  "校准大小 · 第 {0} 轮 · {1}/{2}": "Adjusting size · Pass {0} · {1}/{2}",
+  "校准大小 · 第{0}轮": "Adjusting size · Pass {0}",
+  "卸下": "Unequip",
+  "新的一天，先接住一份好心情喵。": "A new day, and a little happiness to start it, meow.",
+  "星星发夹": "Star hair clip",
+  "修改密码": "Change password",
+  "需要中文或 emoji 密码时，请选择 7Z 格式。": "Choose 7Z for Chinese characters or emoji in passwords.",
+  "选好档位即可生成 GIF": "Choose a quality level to create a GIF",
+  "选好方案即可开始压缩": "Choose a plan to start compression",
+  "选择 4 位或 6 位纯数字密码后重试。": "Choose a 4- or 6-digit numeric password and try again.",
+  "选择 DLL": "Choose DLL",
+  "选择包含 ffmpeg.exe 和 ffprobe.exe 的文件夹": "Choose the folder containing ffmpeg.exe and ffprobe.exe",
+  "选择保存位置": "Choose save location",
+  "选择处理功能": "Choose processing tool",
+  "选择处理后的保存位置": "Choose where to save processed files",
+  "选择处理用途": "Choose an action",
+  "选择窗口化游戏": "Choose a windowed game",
+  "选择待处理文件": "Choose files to process",
+  "选择格式后即可开始": "Choose a format to start",
+  "选择功能": "Choose tool",
+  "选择减少动效后，猫咪和界面会立即切换为静态反馈。": "Reduced motion immediately switches the cat and interface to still feedback.",
+  "选择可信的 Windows x64 7z.dll": "Choose a trusted Windows x64 7z.dll",
+  "选择输出格式": "Choose output format",
+  "选择位置": "Choose location",
+  "选择文件": "Choose files",
+  "选择文件…": "Choose files…",
+  "选择文件夹": "Choose folder",
+  "选择文件夹…": "Choose folder…",
+  "选择要打包的文件夹": "Choose a folder to archive",
+  "选择用途，轻松处理。文件始终留在你的电脑上。": "Choose an action and process files easily. Your files always stay on your computer.",
+  "选择用途后加入队列，还可以调整参数。可接收数量为初步检查，导入时会验证文件内容。": "Choose an action to add files to the queue, then adjust settings. Accepted counts are preliminary; file content is checked during import.",
+  "选中的源文件已不存在。": "The selected source file no longer exists.",
+  "压缩": "Compress",
+  "压缩包": "Archives",
+  "压缩包包含不安全的文件路径。": "The archive contains unsafe file paths.",
+  "压缩包包含绝对路径。": "The archive contains absolute paths.",
+  "压缩包包含链接、设备、备用数据流或删除条目。": "The archive contains links, devices, alternate data streams or deletion entries.",
+  "压缩包包含无效文件名。": "The archive contains an invalid file name.",
+  "压缩包包含系统保留文件名。": "The archive contains a system-reserved file name.",
+  "压缩包不是有效的 TAR 包装格式。": "The archive is not a valid TAR wrapper format.",
+  "压缩包超过安全限额。": "The archive exceeds the safety limit.",
+  "压缩包处理遇到了问题。": "Archive processing encountered a problem.",
+  "压缩包分卷不完整或编号重复。": "Archive volumes are incomplete or have duplicate numbers.",
+  "压缩包格式": "Archive format",
+  "压缩包工具": "Archive tools",
+  "压缩包检查已取消": "Archive checking cancelled",
+  "压缩包结构损坏或分卷不完整。": "The archive structure is damaged or volumes are incomplete.",
+  "压缩包解压或校验失败。": "Archive extraction or verification failed.",
+  "压缩包路径超出目标文件夹。": "The archive path leaves the destination folder.",
+  "压缩包路径无效。": "The archive path is invalid.",
+  "压缩包没有可完整验证的加密数据。": "The archive has no encrypted data that can be fully verified.",
+  "压缩包没有可完整验证的加密文件数据。": "The archive has no encrypted file data that can be fully verified.",
+  "压缩包名称": "Archive name",
+  "压缩包请求读取不属于当前档案的外部文件。": "The archive requested an external file that is not part of this archive.",
+  "压缩包缺少分卷。": "Archive volumes are missing.",
+  "压缩包设置": "Archive settings",
+  "压缩包实际文件大小与声明不一致。": "The actual archive file size does not match the declared size.",
+  "压缩包数据或分卷不可用。": "Archive data or volumes are unavailable.",
+  "压缩包条目数超过安全限额。": "The archive entry count exceeds the safety limit.",
+  "压缩包无需密码。": "The archive does not need a password.",
+  "压缩包校验失败或数据不完整。": "Archive verification failed or the data is incomplete.",
+  "压缩包校验限额无效。": "Archive verification limits are invalid.",
+  "压缩包引擎不完整": "Archive engine incomplete",
+  "压缩包引擎不完整，请在设置中查看": "Archive engine incomplete. Check Settings.",
+  "压缩包引擎没有返回完整结果。": "The archive engine did not return a complete result.",
+  "压缩包引擎设置": "Archive engine settings",
+  "压缩包引擎未能完成此任务。": "The archive engine could not finish this task.",
+  "压缩包引擎无法启动。": "The archive engine could not start.",
+  "压缩包引擎需要 Windows。": "The archive engine requires Windows.",
+  "压缩包引擎已就绪 · 7-Zip": "Archive engine ready · 7-Zip",
+  "压缩包中文件与目录路径冲突。": "File and folder paths conflict inside the archive.",
+  "压缩包中有重复或大小写冲突的路径。": "The archive contains duplicate paths or paths that differ only in case.",
+  "压缩队列": "Compression queue",
+  "压缩没有生成完整文件。": "Compression did not produce a complete file.",
+  "压缩任务失败。": "Compression task failed.",
+  "压缩任务未能完成。": "The compression task could not finish.",
+  "压缩设置无效。": "Compression settings are invalid.",
+  "压缩文件没有通过完整读取检查。": "The compressed file failed a full read check.",
+  "压缩引擎报告错误。": "The archive engine reported an error.",
+  "压缩引擎不完整。": "The archive engine is incomplete.",
+  "压缩引擎不支持此格式。": "The archive engine does not support this format.",
+  "压缩引擎不支持此加密或压缩算法。": "The archive engine does not support this encryption or compression algorithm.",
+  "压缩引擎不支持所选参数。": "The archive engine does not support the selected settings.",
+  "压缩引擎不支持压缩包使用的算法。": "The archive engine does not support the algorithm used by this archive.",
+  "压缩引擎没有完成密码验证。": "The archive engine did not finish password verification.",
+  "压缩引擎请求了未校验的条目。": "The archive engine requested an unchecked entry.",
+  "压缩引擎未完整验证所有请求的条目。": "The archive engine did not fully verify every requested entry.",
+  "压缩引擎无法启动。": "The compression engine could not start.",
+  "压缩引擎需要 64 位 Windows。": "The archive engine requires 64-bit Windows.",
+  "压缩引擎重复返回同一条目的验证结果。": "The archive engine returned duplicate verification results for an entry.",
+  "压缩支持混合添加常见的媒体文件。": "Compression supports a mix of common media file types.",
+  "演示模式": "Presentation mode",
+  "也可以点击选择 · 支持批量添加": "Or click to choose files · Batch import supported",
+  "夜里好喵，慢慢来，别忘了照顾自己。": "Hello, night owl. Take your time and remember to look after yourself.",
+  "夜深啦喵，忙完也要早点休息。": "It's getting late, meow. Get some rest when you're done.",
+  "夜晚也有猫咪陪你，欢迎回来喵！": "Your cat is here at night too. Welcome back, meow!",
+  "一份香香的小鱼干，喂食时消耗一份。": "A tasty portion of dried fish. One portion is used when feeding.",
+  "一个专业软件里，住着一只可爱的猫。": "A professional app with a lovable cat inside.",
+  "一颗蓝紫色的小星星，可随时卸下。": "A little blue-purple star. Remove it whenever you like.",
+  "一起玩": "Play together",
+  "一起玩耍": "Play together",
+  "移除": "Remove",
+  "移除选择": "Remove selected",
+  "移除选择的文件": "Remove selected files",
+  "已测试 {0:N0} / {1:N0} · 剩余 {2:N0}": "Tested {0:N0} / {1:N0} · {2:N0} remaining",
+  "已尝试，暂未找到密码": "Tested, password not found",
+  "已处理，未校验原图": "Processed, original image unverified",
+  "已读取上一次保存的桌宠存档，请保留当前存档以便排查。": "The previous pet save was loaded. Keep the current save for troubleshooting.",
+  "已符合上限": "Already within limit",
+  "已复制": "Copied",
+  "已接住 {0} 个文件，当前任务结束后再选功能。": "Received {0} files. Choose an action after the current task finishes.",
+  "已接住 {0} 项。选择用途后加入队列，再调整参数并开始。": "Received {0} items. Choose an action to add them to the queue, then adjust settings and start.",
+  "已解压 {0} 个条目 · {1}": "Extracted {0} entries · {1}",
+  "已经戴好啦。": "Already equipped.",
+  "已经尽力压缩，但这个大小暂时无法完整保存文件。": "The smallest attempted size cannot preserve the complete file.",
+  "已买好{0}，放进背包啦。": "Bought {0} and placed it in your inventory!",
+  "已切换 CPU 破解 · 点击开始恢复测试全部数字组合": "Switched to CPU search · Click Start recovery to test every numeric combination",
+  "已取消": "Cancelled",
+  "已取消 · 未开始的任务保留，已取消任务可从头重试": "Cancelled · Pending tasks are kept; cancelled tasks can restart from the beginning",
+  "已添加 {0} / 100 条常用数字 · 仅本次会话": "Added {0} / 100 common numbers · This session only",
+  "已添加 {0} 个 · 选好方案即可开始": "Added {0} · Choose a plan to start",
+  "已添加 {0} 个，{1} 个无法导入": "Added {0}; {1} could not be imported",
+  "已添加 {0} 个文件 · ": "Added {0} files · ",
+  "已添加 {0} 个文件 · {1} 个需要选择输出格式": "Added {0} files · {1} need an output format",
+  "已添加 {0} 个文件，{1} 个无法导入": "Added {0} files; {1} could not be imported",
+  "已添加 {0} 个压缩包 · 选择方案后开始恢复": "Added {0} archives · Choose a plan to start recovery",
+  "已添加 {0} 张图片 · 选好参数即可开始": "Added {0} images · Choose settings to start",
+  "已停止": "Stopped",
+  "已停止 · 尚未开始的任务保留，已停止任务可重试": "Stopped · Pending tasks are kept; stopped tasks can be retried",
+  "已停止 · 尚未开始的图片仍在队列中": "Stopped · Pending images remain in the queue",
+  "已停止 · 尚未开始的文件仍在队列中": "Stopped · Pending files remain in the queue",
+  "已停止，准备好了可以继续。": "Stopped. Continue whenever you're ready.",
+  "已停止归档处理": "Archive processing stopped",
+  "已完成": "Completed",
+  "已完成 · 校验通过": "Completed · Verified",
+  "已选未开始的任务": "Selected pending tasks",
+  "已拥有": "Owned",
+  "已拥有{0}": "Already own {0}",
+  "已暂停，准备好再继续": "Paused. Continue when you're ready.",
+  "已重新加入待处理队列": "Returned to the pending queue",
+  "已重新加入待处理队列 · 加密压缩包请重新输入密码": "Returned to the pending queue · Re-enter passwords for encrypted archives",
+  "已重新加入队列 · 从第一个候选开始恢复": "Returned to the queue · Recovery restarts from the first candidate",
+  "音乐与录音，选好格式就可以开始。": "Choose a format to start processing music and recordings.",
+  "音频文件请使用“音频转换”。": "Use Audio conversion for audio files.",
+  "音频转换": "Audio conversion",
+  "引擎：独立 FFmpeg / ffprobe 组件（GPL-3.0-or-later）· 7-Zip\n桌面界面：.NET 10 · WPF\n主程序通过命令行调用 FFmpeg / ffprobe。引擎许可和完整对应源码取得方式见随附说明，可在设置中替换兼容引擎。\n支持创建 ZIP / 7Z / TAR / TAR.GZ；RAR 仅解压和密码恢复。内置数字模式由本项目自行生成。": "Engines: Separate FFmpeg / ffprobe components (GPL-3.0-or-later) · 7-Zip\nDesktop interface: .NET 10 · WPF\nThe app invokes FFmpeg / ffprobe through the command line. See the bundled notices for licenses and complete corresponding source. Compatible engines can be selected in Settings.\nCreates ZIP / 7Z / TAR / TAR.GZ. RAR supports extraction and password recovery only. Built-in numeric patterns are generated by this project.",
+  "引擎路径无效，请重新选择 7z.dll。": "The engine path is invalid. Select 7z.dll again.",
+  "引擎随软件提供。替换时选择来源可信、接口兼容的 x64 版本。": "The engine is included. Replacements must be trusted x64 versions with a compatible interface.",
+  "引擎文件不完整": "Engine files incomplete",
+  "应用到全部未开始的 GIF 任务 · 后续添加也使用此档位": "Applies to all pending GIF tasks and files added later",
+  "应用到全部未开始的压缩任务 · 后续添加也使用此设置": "Applies to all pending compression tasks and files added later",
+  "应用到已选 {0} 个文件 · 后续添加也使用此档位": "Applies to {0} selected files and files added later",
+  "应用到已选 {0} 个文件 · 后续添加也使用此设置": "Applies to {0} selected files and files added later",
+  "永久解锁逗猫棒玩耍。": "Permanently unlocks play with the cat wand.",
+  "永久解锁毛线球玩耍，不需要反复购买。": "Permanently unlocks play with the yarn ball. No repeat purchase needed.",
+  "优先尝试等长数字；较长数字取前后段，较短数字重复或补零，再尝试内置规则候选；耗尽后停止。": "Try numbers of the selected length first. Longer numbers use leading and trailing parts; shorter numbers repeat or add zeros. Then test built-in patterns and stop when exhausted.",
+  "有 {0} 个文件等你选择处理方式。": "{0} files are waiting for you to choose an action.",
+  "遇到问题": "Needs attention",
+  "原格式不适合此压缩方式，请为文件选择输出格式。": "The original format does not suit this compression mode. Choose an output format for this file.",
+  "原格式需更换后压缩": "Choose another format to compress",
+  "原格式暂时不适合压缩。": "The original format is not suitable for compression.",
+  "原画": "Original",
+  "原画档无法在 GIF 中完整保存这个视频的像素比例。": "Original quality cannot fully preserve this video's pixel aspect ratio in GIF.",
+  "源文件必须为绝对路径。": "The source file must be an absolute path.",
+  "源文件条目数超过安全限额。": "The source entry count exceeds the safety limit.",
+  "源文件在读取过程中发生变化。": "The source file changed while being read.",
+  "源文件在建立快照时发生变化。": "The source file changed while creating a snapshot.",
+  "源文件在开始压缩前发生变化。": "The source file changed before compression started.",
+  "源文件在任务期间发生变化。": "The source file changed during the task.",
+  "源文件总大小超过安全限额。": "The total source size exceeds the safety limit.",
+  "源压缩包必须为绝对路径。": "The source archive must be an absolute path.",
+  "源压缩包已不存在。": "The source archive no longer exists.",
+  "暂不支持 APNG 或动画图片。": "APNG and animated images are not supported.",
+  "暂不支持把链接或目录联接打包。": "Archiving links and directory junctions is not supported.",
+  "暂不支持此压缩包的加密或压缩算法。": "This archive's encryption or compression algorithm is unsupported.",
+  "暂不支持动画、多页或多画面的图片。": "Animated, multipage and multiple-image files are not supported.",
+  "暂不支持动态 WebP。": "Animated WebP is not supported.",
+  "暂不支持读取压缩包链接。": "Archive links cannot be read.",
+  "暂不支持这种动画或图片编码。": "This animation or image encoding is not supported.",
+  "暂时无法读取完整时长，不能安全控制文件大小。": "The full duration cannot be read, so file size cannot be safely controlled.",
+  "暂时无法读取压缩包。": "The archive cannot be read right now.",
+  "暂时无法读取这个视频的完整画面和时间信息。": "The video's complete frames and timing information cannot be read.",
+  "暂时无法读取这个视频的完整时长。": "The video's full duration cannot be read.",
+  "暂时无法读取这个文件。": "This file cannot be read right now.",
+  "暂时无法读取这个文件或文件夹。": "This file or folder cannot be read right now.",
+  "暂时无法读取这张图片。": "This image cannot be read right now.",
+  "暂时无法识别这个文件。": "This file cannot be recognized right now.",
+  "暂时无法识别这张图片。": "This image cannot be recognized right now.",
+  "暂时隐藏": "Hide temporarily",
+  "暂停": "Pause",
+  "早安，见到你就精神起来啦！": "Good morning. Seeing you brightens my day!",
+  "早上好喵！今天也一起慢慢开始吧。": "Good morning, meow! Let's ease into the day together.",
+  "增大 {0:0.#}%": "Increased {0:0.#}%",
+  "长边最多 1280 像素 · 最高 30 帧/秒 · 256 色": "Long edge ≤1280 px · Up to 30 fps · 256 colors",
+  "长边最多 1280 像素 · 最高 30 帧/秒 · 256 色，保留更多细节。": "Long edge ≤1280 px · Up to 30 fps · 256 colors, for more detail.",
+  "长边最多 240 像素 · 最高 6 帧/秒 · 32 色": "Long edge ≤240 px · Up to 6 fps · 32 colors",
+  "长边最多 240 像素 · 最高 6 帧/秒 · 32 色，体积优先。": "Long edge ≤240 px · Up to 6 fps · 32 colors, for the smallest size.",
+  "长边最多 480 像素 · 最高 12 帧/秒 · 64 色": "Long edge ≤480 px · Up to 12 fps · 64 colors",
+  "长边最多 480 像素 · 最高 12 帧/秒 · 64 色，更省空间。": "Long edge ≤480 px · Up to 12 fps · 64 colors, saving more space.",
+  "长边最多 800 像素 · 最高 20 帧/秒 · 128 色": "Long edge ≤800 px · Up to 20 fps · 128 colors",
+  "长边最多 800 像素 · 最高 20 帧/秒 · 128 色，清晰度与体积均衡。": "Long edge ≤800 px · Up to 20 fps · 128 colors, balancing clarity and size.",
+  "找不到结果": "Result not found",
+  "找到密码啦！可以复制，或转入解压。": "Password found! Copy it or continue to extraction.",
+  "照片与图片，本地转换并保留原文件。": "Convert photos and images locally, keeping the originals.",
+  "这次操作遇到了问题。": "This action encountered a problem.",
+  "这个格式不能完整保留文件内容。": "This format cannot preserve the entire file content.",
+  "这个路径无效。": "This path is invalid.",
+  "这个路径暂不支持。": "This path is not supported.",
+  "这个视频没有通过完整读取检查。": "This video failed a full read check.",
+  "这个视频没有音轨，无法提取音频。": "This video has no audio track to extract.",
+  "这个视频暂时无法在当前档位完整保留帧数和播放时长。": "This quality level cannot preserve the video's full frame count and duration.",
+  "这个视频暂时无法转换为 GIF。": "This video cannot be converted to GIF right now.",
+  "这个输出格式设置无效。": "The output format settings are invalid.",
+  "这个位置没有配饰。": "No accessory is equipped in this slot.",
+  "这个文件包含暂不支持的动画或多页图片。": "This file contains unsupported animation or multiple image pages.",
+  "这个文件不是带画面的视频。": "This file does not contain video frames.",
+  "这个文件不是支持的压缩包格式。": "This file is not a supported archive format.",
+  "这个文件不适合当前功能。": "This file is not suitable for the current tool.",
+  "这个文件不属于支持的静态图片。": "This file is not a supported still image.",
+  "这个文件好像无法正常读取。": "This file could not be read correctly.",
+  "这个文件好像遇到了一点问题。": "This file encountered a problem.",
+  "这个文件或文件夹不适合所选功能，或已无法读取。 ": "This file or folder is unsuitable for the selected tool, or cannot be read. ",
+  "这个文件或文件夹已经移动。": "This file or folder has been moved.",
+  "这个文件里没有可处理的音视频或图片。": "This file contains no audio, video or image data to process.",
+  "这个文件路径无效。": "This file path is invalid.",
+  "这个文件没有通过完整读取检查。": "This file failed a full read check.",
+  "这个文件未能加入队列，请在处理页面查看原因。": "This file could not be queued. Open the processing page for details.",
+  "这个文件无法导入。": "This file cannot be imported.",
+  "这个文件已经移动或无法读取。": "This file has been moved or cannot be read.",
+  "这个文件暂时无法安全压缩。": "This file cannot be safely compressed right now.",
+  "这个文件中没有可转换的视频。": "This file contains no convertible video.",
+  "这个文件中没有可转换的音频。": "This file contains no convertible audio.",
+  "这个压缩包不需要密码。": "This archive does not need a password.",
+  "这个压缩包的密码": "Password for this archive",
+  "这个压缩包好像遇到了一点问题。": "This archive encountered a problem.",
+  "这个压缩包路径暂不支持。": "This archive path is not supported.",
+  "这个压缩包任务无效。": "This archive task is invalid.",
+  "这个压缩结果没有完整保留文件内容。": "This compressed result did not preserve the entire file content.",
+  "这件物品不是配饰。": "This item is not an accessory.",
+  "这么晚还在忙呀？我安静地陪着你。": "Still busy this late? I'll keep you company quietly.",
+  "这批任务的奖励数量超过上限，奖励等待保存。": "This batch's reward exceeds the limit. Rewards are waiting to be saved.",
+  "这批任务没有有效的成功请求列表。": "This batch has no valid successful request list.",
+  "这批任务没有有效的结算编号。": "This batch has no valid settlement ID.",
+  "这批任务已经结算。": "This batch has already been settled.",
+  "这些输入好像遇到了一点问题。": "These inputs encountered a problem.",
+  "这些输入已经在队列中了": "These inputs are already in the queue",
+  "这些图片已经在当前队列中了": "These images are already in the current queue",
+  "这些图片暂时无法处理。": "These images cannot be processed right now.",
+  "这些文件不适合当前页面，请从首页选择用途": "These files do not suit this page. Choose an action from Home.",
+  "这些文件好像遇到了一点问题。": "These files encountered a problem.",
+  "这些文件已经在队列中了": "These files are already in the queue",
+  "这些压缩包已在队列中": "These archives are already in the queue",
+  "这些压缩包暂时无法恢复。": "These archives cannot be recovered right now.",
+  "这张图片好像遇到了一点问题。": "This image encountered a problem.",
+  "这张图片或混淆标记不完整。": "This image or its obfuscation marker is incomplete.",
+  "这张图片没有完整解码。": "This image was not fully decoded.",
+  "这张图片已带有本软件的混淆标记。": "This image already has this app's obfuscation marker.",
+  "这张图片已有混淆标记。": "This image already has an obfuscation marker.",
+  "这张图片暂时无法处理。": "This image cannot be processed right now.",
+  "这张图片暂时无法读取，请检查格式和文件是否完整。": "This image cannot be read right now. Check its format and integrity.",
+  "正在帮你{0} {1}": "Helping you {0} {1}",
+  "正在帮你打包文件……": "Archiving your files…",
+  "正在帮你恢复图片……": "Restoring your images…",
+  "正在帮你解压文件……": "Extracting your files…",
+  "正在帮你排列图片……": "Rearranging your images…",
+  "正在保存": "Saving",
+  "正在尝试恢复数字密码……": "Trying to recover numeric passwords…",
+  "正在打包": "Archiving",
+  "正在恢复": "Recovering",
+  "正在恢复 · {0}/{1}": "Recovering · {0}/{1}",
+  "正在恢复数字密码": "Recovering numeric passwords",
+  "正在混淆": "Obfuscating",
+  "正在检查待恢复压缩包……": "Checking archives for recovery…",
+  "正在检查归档输入……": "Checking archive inputs…",
+  "正在检查图片……": "Checking images…",
+  "正在检查文件……": "Checking files…",
+  "正在接住文件，马上就好。": "Receiving files. Almost there!",
+  "正在解混淆": "Restoring image",
+  "正在解压": "Extracting",
+  "正在陪你一起处理文件。": "Working on your files together.",
+  "正在取消": "Cancelling",
+  "正在取消 · 等待进程退出": "Cancelling · Waiting for process exit",
+  "正在取消，等待恢复进程退出（最多约 5 秒）……": "Cancelling. Waiting for recovery processes to exit (up to about 5 seconds)…",
+  "正在认真整理毛毛。": "Carefully grooming my fur.",
+  "正在停止": "Stopping",
+  "正在停止，等待处理进程退出……": "Stopping. Waiting for the processing engine to exit…",
+  "正在停止，等待图片处理完成清理……": "Stopping. Waiting for image cleanup to finish…",
+  "正在完整验证": "Verifying entire archive",
+  "正在校验": "Verifying",
+  "支持的文件|{0}|所有文件|*.*": "Supported files|{0}|All files|*.*",
+  "知道了": "Got it",
+  "只用于这个压缩包；留空使用上方批次密码。任务结束后会清空。": "Only for this archive. Leave blank to use the batch password above. Cleared when tasks finish.",
+  "只有 7z 支持分卷，分卷大小须至少为 1 MiB。": "Only 7z supports split volumes, with at least 1 MiB per volume.",
+  "只有 ZIP 和 7Z 支持密码保护。": "Only ZIP and 7Z support password protection.",
+  "只在本次会话使用；任务结束后清空，不会记住": "Used for this session only. Cleared after tasks finish and never remembered.",
+  "指定大小": "Target size",
+  "中": "Medium",
+  "中 · ≤50%": "Medium · ≤50%",
+  "中 · CPU 占用上限约 50%；实际占用可能更低。": "Medium · CPU limit about 50%; actual use may be lower.",
+  "中强度": "Medium intensity",
+  "中午好，留一点时间伸个懒腰吧。": "Good afternoon. Make a little time for a stretch.",
+  "中午好喵！忙完记得好好吃饭。": "Hello at midday, meow! Remember to eat well when you're done.",
+  "重排像素": "Rearrange pixels",
+  "重试保存": "Retry saving",
+  "重试失败 / 已停止": "Retry failed / Stopped",
+  "重试失败或已停止的任务": "Retry failed or stopped tasks",
+  "逐行添加或粘贴常用数字": "Add or paste common numbers, one per line",
+  "逐行粘贴": "Paste lines",
+  "逐一测试全部 {0} 位纯数字密码，包含前导零。共 {1:N0} 个组合。": "Test every {0}-digit numeric password, including leading zeros. {1:N0} combinations in total.",
+  "主题模式": "Theme",
+  "转换队列": "Conversion queue",
+  "转换没有生成完整文件。": "Conversion did not produce a complete file.",
+  "转换为": "Convert to",
+  "转换引擎不完整，请在设置中查看": "Conversion engine incomplete. Check Settings.",
+  "转换引擎无法启动。": "The conversion engine could not start.",
+  "装备": "Equip",
+  "状态": "Status",
+  "追到毛线球啦！": "Caught the yarn ball!",
+  "准备就绪": "Ready",
+  "准备就绪 · 当前页的任务会分别处理": "Ready · Tasks on this page are processed separately",
+  "准备就绪 · 添加输入以创建": "Ready · Add inputs to create a queue",
+  "准备就绪 · 添加图片以创建": "Ready · Add images to create a queue",
+  "准备就绪 · 添加文件以创建": "Ready · Add files to create a queue",
+  "准备就绪 · 添加压缩包以创建恢复队列": "Ready · Add archives to create a recovery queue",
+  "准备文件": "Prepare files",
+  "准备中": "Preparing",
+  "桌宠存档暂时无法保存，这次交易没有确认；待保存的奖励会自动重试。": "The pet save could not be written. This transaction is unconfirmed; pending rewards will retry automatically.",
+  "桌宠存档暂时无法读取，奖励等待保存。": "The pet save could not be read. Rewards are waiting to be saved.",
+  "桌宠存档暂时无法读取，交易没有执行。请保留存档并重启后重试。": "The pet save could not be read. The transaction was not performed. Keep the save and restart the app to try again.",
+  "桌宠存档暂时无法读取，账户交易已暂停；没有覆盖原存档。": "The pet save could not be read. Account transactions are paused, and the original save has not been overwritten.",
+  "桌宠存档暂时无法读取。": "The pet save could not be read.",
+  "桌宠动画偏好": "Pet animation preference",
+  "桌宠结算序号已达到上限，奖励等待保存。": "The pet settlement sequence limit has been reached. Rewards are waiting to be saved.",
+  "桌宠设置": "Pet settings",
+  "桌宠通知未能显示；文件结果保持不变。": "The pet notification could not be shown. File results are unchanged.",
+  "桌面上的小小陪伴": "A little companion on your desktop",
+  "自定义": "Custom",
+  "自定义游戏名单": "Custom game list",
+  "组件许可与来源": "Component licenses and sources",
+  "最大大小必须大于 0。": "The maximum size must be greater than 0.",
+  "最大化": "Maximize",
+  "最大解压条目数": "Maximum extracted entries",
+  "最大解压总量（GiB）": "Maximum extracted size (GiB)",
+  "最大目录层数": "Maximum folder depth",
+  "最多添加 100 条常用数字，请先删除不需要的条目。": "You can add up to 100 common numbers. Remove unwanted entries first.",
+  "最小化": "Minimize",
+  "AAC · 原始音频": "AAC · Raw audio",
+  "CPU 配额不可用 · 当前采用近似节流": "CPU quota unavailable · Using approximate throttling",
+  "CPU 破解": "CPU search",
+  "CPU 占用上限约 20%；实际占用可能更低。": "CPU limit about 20%; actual use may be lower.",
+  "CPU 占用上限约 50%；实际占用可能更低。": "CPU limit about 50%; actual use may be lower.",
+  "CPU 占用上限约 80%；实际占用可能更低。": "CPU limit about 80%; actual use may be lower.",
+  "FFmpeg / ffprobe 随附引擎按 GPL-3.0-or-later 提供；完整许可、组件来源和对应源码取得方式见 THIRD-PARTY-NOTICES.md 与 tools/ffmpeg/source/README.md。7-Zip 对应源码随包附带。": "The bundled FFmpeg / ffprobe engine is provided under GPL-3.0-or-later. See THIRD-PARTY-NOTICES.md and tools/ffmpeg/source/README.md for complete licenses, component sources and corresponding source availability. Corresponding 7-Zip source is included.",
+  "GIF · 保留动画": "GIF · Keep animation",
+  "GIF · 动图": "GIF · Animated",
+  "GIF 低档位": "GIF low quality",
+  "GIF 动画帧超出了画布。": "A GIF frame extends outside its canvas.",
+  "GIF 队列": "GIF queue",
+  "GIF 高档位": "GIF high quality",
+  "GIF 画布尺寸无效。": "Invalid GIF canvas dimensions.",
+  "GIF 极低档位": "GIF very low quality",
+  "GIF 控制块终止标记无效。": "Invalid GIF control block terminator.",
+  "GIF 块无效。": "Invalid GIF block.",
+  "GIF 图形控制块无效。": "Invalid GIF graphic control block.",
+  "GIF 文件头无效。": "Invalid GIF header.",
+  "GIF 文件未完整结束。": "The GIF file did not end completely.",
+  "GIF 原画档位": "GIF original quality",
+  "GIF 中档位": "GIF medium quality",
+  "GIF 转换引擎无法启动。": "The GIF conversion engine could not start.",
+  "Gilbert 图片模式": "Gilbert image mode",
+  "M4V · 常见视频": "M4V · Common video",
+  "MiB / 卷": "MiB / Volume",
+  "MOV · 常见视频": "MOV · Common video",
+  "PNG · JPG · WebP · BMP · 输出 PNG": "PNG · JPG · WebP · BMP · PNG output",
+  "PNG 块长度无效。": "Invalid PNG chunk length.",
+  "TAR · 仅打包": "TAR · Archive only",
+  "TAR 和 TAR.GZ 不支持密码加密。": "TAR and TAR.GZ do not support password encryption.",
+  "TAR 压缩包包含链接或不支持的特殊条目。": "The TAR archive contains links or unsupported special entries.",
+  "TAR 只打包，不压缩；不支持归档密码和分卷。": "TAR archives without compression. Passwords and split volumes are unsupported.",
+  "TAR.GZ · 压缩打包": "TAR.GZ · Compressed archive",
+  "TAR.GZ 校验失败。": "TAR.GZ verification failed.",
+  "WebP 块长度无效。": "Invalid WebP chunk length.",
+  "ZIP · 7Z · RAR · 4 / 6 位纯数字": "ZIP · 7Z · RAR · 4 / 6 numeric digits",
+  "ZIP · 7Z · RAR（仅解压） · TAR · GZ · BZ2 · XZ · TAR.GZ / TAR.BZ2 / TAR.XZ": "ZIP · 7Z · RAR (extract only) · TAR · GZ · BZ2 · XZ · TAR.GZ / TAR.BZ2 / TAR.XZ",
+  "ZIP · 通用兼容": "ZIP · Broad compatibility",
+  "ZIP 密码限 1–99 个英文、数字或符号；中文或 emoji 密码请选择 7Z。": "ZIP passwords must contain 1–99 ASCII letters, numbers or symbols. Choose 7Z for Chinese characters or emoji.",
+  "ZIP 密码须为 1 至 99 个可打印 ASCII 字符。": "ZIP passwords must contain 1–99 printable ASCII characters.",
+  "ZIP 密码须为 1–99 个可打印英文字符。": "ZIP passwords must contain 1–99 printable ASCII characters.",
+  "ZIP 无密码时适合常见解压工具；启用密码后使用 AES-256，Windows 内置解压可能无法打开，文件名仍可见。": "Unencrypted ZIP works with common extraction tools. Password protection uses AES-256, which Windows' built-in extractor may not support. File names remain visible.",
+  "{0:0.##} 喵喵币 · 和桌面猫咪共享互动与装扮": "{0:0.##} Meow Coins · Shared play and accessories with your desktop cat",
+  "{0} · 已累计 {1} · 本次 {2:0.##} 喵喵币": "{0} · Worked {1} · {2:0.##} Meow Coins this session",
+  "●  {0:0.##} 喵喵币": "●  {0:0.##} Meow Coins",
+  "本程序由大肥猫瑞瑞制作。": "Created by 大肥猫瑞瑞.",
+  "本次工作了 {0}。": "You worked for {0} this session.",
+  "工作收益尚未保存": "Work earnings have not been saved",
+  "工作中": "Working",
+  "简体中文": "Simplified Chinese",
+  "界面语言 / Language": "Language",
+  "开": "On",
+  "开始工作": "Start work",
+  "每分钟 4 喵喵币，按秒累计并保留两位小数。最小化、隐藏和处理文件时继续；锁屏或休眠时暂停。": "Earn 4 Meow Coins per minute, counted by the second to two decimal places. Work continues while minimized, hidden or processing files, and pauses when your computer is locked or asleep.",
+  "如何联系我？": "How can you contact me?",
+  "上次工作 {0} · 获得 {1:0.##} 喵喵币": "Last session: {0} · Earned {1:0.##} Meow Coins",
+  "收工啦喵！一起赚到了 {0} 喵喵币！": "All done, meow! We earned {0} Meow Coins together!",
+  "双击打开，右键管理桌宠": "Double-click to open; right-click to manage your pet",
+  "太棒了喵！这次赚了 {0} 喵喵币！": "Great job, meow! You earned {0} Meow Coins this time!",
+  "停止工作": "Stop work",
+  "卸载程序": "Uninstaller",
+  "辛苦啦喵！{0} 喵喵币收入囊中！": "Nice work, meow! You pocketed {0} Meow Coins!",
+  "已暂停": "Paused",
+  "邮箱: ": "Email: ",
+  "语言切换立即生效，正在运行的任务不会中断。": "Language changes take effect immediately. Running tasks will continue.",
+  "BMP · 位图": "BMP · Bitmap",
+  "FLAC · 无损压缩": "FLAC · Lossless compression",
+  "GIF · 视频动图": "GIF · Animated video",
+  "JPG · 常用图片": "JPG · Common image",
+  "MP3 · 提取音频": "MP3 · Extract audio",
+  "MP3 · 通用音频": "MP3 · Common audio",
+  "MP4 · H.264（兼容性优先）": "MP4 · H.264 (compatibility first)",
+  "MP4 · H.265（高效压缩）": "MP4 · H.265 (efficient compression)",
+  "PNG · 清晰无损": "PNG · Lossless image",
+  "WAV · 无损 PCM": "WAV · Lossless PCM",
+  "WebP · 轻量图片": "WebP · Compact image",
+  "{0} · 保留格式": "{0} · Keep format",
+  "{0} · 保留动画": "{0} · Keep animation",
+  "{0} · 保留原格式": "{0} · Keep original format",
+  "{0} · 动图": "{0} · Animated",
+  "{0} · 含透明通道": "{0} · Contains transparency",
+  "{0} · 已停止": "{0} · Stopped",
+  "{0} · 部分任务已停止": "{0} · Some tasks stopped",
+  "{0} · 处理中": "{0} · Processing",
+  "准备就绪 · 添加文件以创建{0}": "Ready · Add files to create {0}",
+  "请重新安装完整的软件包。": "Reinstall the complete app."
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/Localization/Locale.cs ---
+using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
+using System.Globalization;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+
+namespace CatFileAssistant.Core;
+
+/// <summary>Local, deterministic application text. File names and captured template values are never translated.</summary>
+public static class Locale
+{
+    private static readonly Regex placeholder = new(@"(?<!\{)\{(?<index>\d+)(?:,-?\d+)?(?::[^{}]*)?\}(?!\})", RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+    private static string language = "zh-CN";
+    private static readonly IReadOnlyDictionary<string, string> catalog = LoadCatalog();
+    private static readonly IReadOnlyDictionary<string, string> reverse = new ReadOnlyDictionary<string, string>(
+        catalog.GroupBy(pair => pair.Value, StringComparer.Ordinal).ToDictionary(group => group.Key, group => group.First().Key, StringComparer.Ordinal));
+    private static readonly Template[] templates = catalog.Where(pair => Placeholders(pair.Key).Count != 0)
+        .Select(pair => new Template(pair.Key, pair.Value)).OrderByDescending(template => template.LiteralLength).ToArray();
+    private static readonly ConcurrentDictionary<string, byte> missing = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<(string Language, string Text), string> rendered = new();
+
+    public static event EventHandler? Changed;
+    public static string Normalize(string? value) => value?.Trim().ToLowerInvariant() is "en" or "en-us" or "english" ? "en-US" : "zh-CN";
+    public static string Language
+    {
+        get => language;
+        set
+        {
+            var next = Normalize(value);
+            if (language == next) return;
+            language = next;
+            Changed?.Invoke(null, EventArgs.Empty);
+        }
+    }
+    public static IReadOnlyDictionary<string, string> Catalog => catalog;
+    public static IReadOnlyCollection<string> MissingKeys => missing.Keys.Order(StringComparer.Ordinal).ToArray();
+    public static void ClearMissingKeys() { missing.Clear(); rendered.Clear(); }
+    public static bool IsEnglish => Language == "en-US";
+
+    public static string T(string source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        return Translate(source, IsEnglish);
+    }
+
+    private static string Translate(string source, bool english)
+    {
+        if (!english) return source;
+        if (catalog.TryGetValue(source, out var translated)) return translated;
+        if (source.Any(character => character is >= '\u4e00' and <= '\u9fff')) missing.TryAdd(source, 0);
+        return source;
+    }
+
+    public static string F(FormattableString source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var english = IsEnglish;
+        var result = string.Format(english ? CultureInfo.GetCultureInfo("en-US") : CultureInfo.GetCultureInfo("zh-CN"), Translate(source.Format, english), source.GetArguments());
+        if (english)
+        {
+            if (rendered.Count > 4096) rendered.Clear();
+            // A translated sentence can contain a user's Chinese filename. It is
+            // already localized and must neither translate that capture nor report it.
+            rendered.TryAdd(("en-US", result), result);
+        }
+        return result;
+    }
+
+    /// <summary>Translates an already rendered application label in either direction. Captures remain byte-for-byte intact.</summary>
+    public static string TranslateText(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return text;
+        if (rendered.Count > 4096) rendered.Clear();
+        return rendered.GetOrAdd((Language, text), key => TranslateRendered(key.Text, key.Language == "en-US"));
+    }
+
+    private static string TranslateRendered(string text, bool english)
+    {
+        if ((english ? catalog : reverse).TryGetValue(text, out var translated)) return translated;
+        if (english && reverse.ContainsKey(text)) return text;
+        // Most presentation updates already passed through T/F. Avoid scanning every
+        // template for plain English or source-language labels on animation/progress ticks.
+        var containsChinese = text.Any(character => character is >= '\u4e00' and <= '\u9fff');
+        if (english && !containsChinese) return text;
+        foreach (var template in templates)
+        {
+            if (template.TryTranslate(text, english, out translated)) return translated;
+        }
+        if (english && containsChinese) missing.TryAdd(text, 0);
+        return text;
+    }
+
+    /// <summary>Checks catalog placeholders without invoking formatters or changing the active language.</summary>
+    public static IReadOnlyList<string> ValidateCatalog()
+    {
+        var errors = new List<string>();
+        foreach (var pair in catalog)
+        {
+            var source = Placeholders(pair.Key).Order().ToArray();
+            var target = Placeholders(pair.Value).Order().ToArray();
+            if (!source.SequenceEqual(target)) errors.Add("Placeholder mismatch: " + pair.Key);
+            if (string.IsNullOrWhiteSpace(pair.Value)) errors.Add("Empty translation: " + pair.Key);
+            try { _ = CompositeFormat.Parse(pair.Key); _ = CompositeFormat.Parse(pair.Value); }
+            catch (FormatException) { errors.Add("Invalid format: " + pair.Key); }
+        }
+        return errors;
+    }
+
+    private static IReadOnlyDictionary<string, string> LoadCatalog()
+    {
+        using var stream = typeof(Locale).Assembly.GetManifestResourceStream("CatFileAssistant.Core.Localization.en-US.json")
+            ?? throw new InvalidOperationException("Application language catalog is missing.");
+        return new ReadOnlyDictionary<string, string>(JsonSerializer.Deserialize<Dictionary<string, string>>(stream)
+            ?? throw new InvalidOperationException("Application language catalog is empty."));
+    }
+
+    private static List<int> Placeholders(string value) => Regex.Matches(value, @"(?<!\{)\{(?<index>\d+)(?:,-?\d+)?(?::[^{}]*)?\}(?!\})", RegexOptions.CultureInvariant)
+        .Select(match => int.Parse(match.Groups["index"].Value, CultureInfo.InvariantCulture)).ToList();
+
+    private sealed class Template
+    {
+        private readonly string source, target;
+        private readonly Regex sourcePattern, targetPattern;
+        public int LiteralLength { get; }
+        public Template(string source, string target)
+        {
+            this.source = source; this.target = target;
+            sourcePattern = Pattern(source); targetPattern = Pattern(target);
+            LiteralLength = placeholder.Replace(source, "").Length;
+        }
+        public bool TryTranslate(string text, bool english, out string translated)
+        {
+            translated = text;
+            Match match;
+            try { match = (english ? sourcePattern : targetPattern).Match(text); }
+            catch (RegexMatchTimeoutException) { return false; }
+            if (!match.Success) return false;
+            translated = placeholder.Replace(english ? target : source, part => match.Groups["p" + part.Groups["index"].Value].Value)
+                .Replace("{{", "{", StringComparison.Ordinal).Replace("}}", "}", StringComparison.Ordinal);
+            return true;
+        }
+        private static Regex Pattern(string format)
+        {
+            var result = new StringBuilder("\\A");
+            var position = 0;
+            var seen = new HashSet<string>();
+            foreach (Match match in placeholder.Matches(format))
+            {
+                result.Append(Regex.Escape(format[position..match.Index].Replace("{{", "{", StringComparison.Ordinal).Replace("}}", "}", StringComparison.Ordinal)));
+                var index = match.Groups["index"].Value;
+                result.Append(seen.Add(index) ? "(?<p" + index + ">.*?)" : "\\k<p" + index + ">");
+                position = match.Index + match.Length;
+            }
+            result.Append(Regex.Escape(format[position..].Replace("{{", "{", StringComparison.Ordinal).Replace("}}", "}", StringComparison.Ordinal))).Append("\\z");
+            return new Regex(result.ToString(), RegexOptions.CultureInvariant | RegexOptions.Singleline, TimeSpan.FromMilliseconds(30));
+        }
+    }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/PetEconomyContracts.cs ---
+using System.Collections.ObjectModel;
+
+namespace CatFileAssistant.Core;
+
+public enum PetShopItemId { Fish, CannedFood, Yarn, Wand, Collar, StarClip }
+public enum PetAccessorySlot { Neck, Head }
+public enum PetShopItemKind { Food, Toy, Accessory }
+
+public sealed record PetShopItem(PetShopItemId Id, string Icon, string Title, string Description,
+    int Price, PetShopItemKind Kind, PetAccessorySlot? AccessorySlot = null)
+{
+    public bool Consumable => Kind == PetShopItemKind.Food;
+}
+
+public static class PetShopCatalog
+{
+    public static IReadOnlyList<PetShopItem> Items { get; } = Array.AsReadOnly(new[]
+    {
+        new PetShopItem(PetShopItemId.Fish, "🐟", "小鱼干", "一份香香的小鱼干，喂食时消耗一份。", 10, PetShopItemKind.Food),
+        new PetShopItem(PetShopItemId.CannedFood, "🥫", "罐头", "打开罐头，和猫咪分享悠闲时光。", 20, PetShopItemKind.Food),
+        new PetShopItem(PetShopItemId.Yarn, "🧶", "毛线球", "永久解锁毛线球玩耍，不需要反复购买。", 30, PetShopItemKind.Toy),
+        new PetShopItem(PetShopItemId.Wand, "🪶", "逗猫棒", "永久解锁逗猫棒玩耍。", 40, PetShopItemKind.Toy),
+        new PetShopItem(PetShopItemId.Collar, "🔔", "铃铛项圈", "给猫咪戴上小铃铛，可随时卸下。", 60, PetShopItemKind.Accessory, PetAccessorySlot.Neck),
+        new PetShopItem(PetShopItemId.StarClip, "⭐", "星星发夹", "一颗蓝紫色的小星星，可随时卸下。", 80, PetShopItemKind.Accessory, PetAccessorySlot.Head)
+    });
+
+    public static PetShopItem? Find(PetShopItemId id) => Items.FirstOrDefault(item => item.Id == id);
+}
+
+public sealed record PetWorkSessionSummary(Guid SessionId, TimeSpan Duration, decimal CoinsEarned);
+
+public sealed record PetTransactionResult(bool Succeeded, string Message, decimal CoinsChanged = 0,
+    PetWorkSessionSummary? WorkSession = null);
+
+/// <summary>A detached immutable view: modifying it cannot change the local wallet.</summary>
+public sealed record PetEconomySnapshot(decimal Coins, IReadOnlyDictionary<PetShopItemId, int> Inventory,
+    IReadOnlyDictionary<PetAccessorySlot, PetShopItemId> EquippedAccessories, bool WorkRequested,
+    bool WorkRunning, TimeSpan WorkElapsed, decimal WorkEarned, PetWorkSessionSummary? LastWorkSession,
+    bool HasPendingRewards, string? LastError,
+    long Sequence, long LastSettlementSequence)
+{
+    // Compatibility for older diagnostic callers; the UI uses cumulative WorkElapsed.
+    public TimeSpan WorkRemaining => TimeSpan.FromTicks(Math.Max(0, TimeSpan.FromMinutes(5).Ticks - WorkElapsed.Ticks));
+    public int Quantity(PetShopItemId id) => Inventory.GetValueOrDefault(id);
+    public bool Owns(PetShopItemId id) => Quantity(id) > 0;
+    public bool IsEquipped(PetShopItemId id) => EquippedAccessories.Values.Contains(id);
+
+    public static IReadOnlyDictionary<TKey, TValue> ReadOnlyCopy<TKey, TValue>(Dictionary<TKey, TValue> source)
+        where TKey : notnull => new ReadOnlyDictionary<TKey, TValue>(new Dictionary<TKey, TValue>(source));
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/RecoveryContracts.cs ---
+using System.Globalization;
+
+namespace CatFileAssistant.Core;
+
+public enum RecoveryMode { CommonPasswords, Cpu }
+public enum RecoveryIntensity { Low, Medium, High }
+public enum RecoveryStatus { Found, Exhausted, Cancelled, Failed }
+public sealed record RecoveryOptions(RecoveryMode Mode = RecoveryMode.CommonPasswords, int Digits = 4,
+    RecoveryIntensity Intensity = RecoveryIntensity.Medium, ArchiveLimits? Limits = null);
+public sealed record RecoveryRequest(Guid Id, string SourcePath, RecoveryOptions Options,
+    IReadOnlyList<string>? CommonNumbers = null);
+public sealed record RecoveryProgress(long CompletedCandidates, long TotalCandidates, string Stage = "testing",
+    bool CpuLimitApproximate = false)
+{
+    public long Remaining => Math.Max(0, TotalCandidates - CompletedCandidates);
+    public double Percent => TotalCandidates > 0 ? Math.Clamp(100d * CompletedCandidates / TotalCandidates, 0, 100) : 0;
+}
+public sealed record RecoveryResult(RecoveryStatus Status, string? Password = null, long CompletedCandidates = 0,
+    long TotalCandidates = 0, bool PossiblePassword = false, ConversionError? Error = null);
+public interface IPasswordRecoveryEngine
+{
+    Task<RecoveryResult> RecoverAsync(RecoveryRequest request, IProgress<RecoveryProgress>? progress = null,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>Original numeric pattern rules v1; no external or leaked password collection is used.</summary>
+public static class RecoveryCandidates
+{
+    public static int SpaceSize(int digits) => digits switch
+    { 4 => 10_000, 6 => 1_000_000, _ => throw new ArgumentException(Locale.T("请选择 4 位或 6 位纯数字密码。")) };
+
+    public static int CpuPercent(RecoveryIntensity intensity) => intensity switch
+    { RecoveryIntensity.Low => 20, RecoveryIntensity.Medium => 50, RecoveryIntensity.High => 80,
+        _ => throw new ArgumentException(Locale.T("请选择有效的计算强度。")) };
+
+    public static IReadOnlyList<string> NormalizeNumbers(IEnumerable<string>? inputs)
+    {
+        var values = new List<string>(); var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var input in inputs ?? [])
+        {
+            var value = input?.Trim() ?? "";
+            if (value.Length is < 1 or > 20 || value.Any(c => c is < '0' or > '9'))
+                throw new ArgumentException(Locale.T("每条常用数字须为 1–20 个数字（0–9）。"));
+            if (seen.Add(value)) values.Add(value);
+            if (values.Count > 100) throw new ArgumentException(Locale.T("常用数字最多保存 100 条。"));
+        }
+        return values.AsReadOnly();
+    }
+
+    public static IReadOnlyList<IReadOnlyList<string>> CommonStages(IEnumerable<string>? inputs, int digits)
+    {
+        _ = SpaceSize(digits);
+        var numbers = NormalizeNumbers(inputs);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var exact = new List<string>(); var variants = new List<string>(); var builtIn = new List<string>();
+        void Add(List<string> target, string candidate) { if (seen.Add(candidate)) target.Add(candidate); }
+        foreach (var value in numbers.Where(value => value.Length == digits)) Add(exact, value);
+        foreach (var value in numbers)
+        {
+            if (value.Length > digits) { Add(variants, value[..digits]); Add(variants, value[^digits..]); }
+            else if (value.Length < digits)
+            {
+                Add(variants, value.PadLeft(digits, '0')); Add(variants, value.PadRight(digits, '0'));
+                Add(variants, string.Concat(Enumerable.Repeat(value, (digits + value.Length - 1) / value.Length))[..digits]);
+            }
+        }
+        foreach (var candidate in BuiltIn(digits)) Add(builtIn, candidate);
+        return new IReadOnlyList<string>[] { exact.AsReadOnly(), variants.AsReadOnly(), builtIn.AsReadOnly() };
+    }
+
+    public static IReadOnlyList<string> BuiltIn(int digits)
+    {
+        _ = SpaceSize(digits); var values = new List<string>();
+        for (var digit = 0; digit < 10; digit++) values.Add(new string((char)('0' + digit), digits));
+        foreach (var direction in new[] { 1, -1 })
+            for (var start = 0; start < 10; start++)
+                values.Add(new string(Enumerable.Range(0, digits).Select(i => (char)('0' + (start + direction * i + 20) % 10)).ToArray()));
+        foreach (var pair in new[] { "12", "21", "10", "01", "52", "25", "69", "96" })
+            values.Add(string.Concat(Enumerable.Repeat(pair, digits / 2)));
+        return values.Distinct(StringComparer.Ordinal).ToArray();
+    }
+
+    public static long Total(RecoveryOptions options, IEnumerable<string>? numbers = null)
+    {
+        if (!Enum.IsDefined(options.Mode)) throw new ArgumentException(Locale.T("请选择有效的恢复方式。"));
+        _ = CpuPercent(options.Intensity);
+        return options.Mode == RecoveryMode.Cpu ? SpaceSize(options.Digits) : CommonStages(numbers, options.Digits).Sum(s => (long)s.Count);
+    }
+
+    public static IEnumerable<string> EnumerateDigits(int digits)
+    {
+        var count = SpaceSize(digits); var format = "D" + digits;
+        for (var i = 0; i < count; i++) yield return i.ToString(format, CultureInfo.InvariantCulture);
+    }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/SerialArchiveQueue.cs ---
+namespace CatFileAssistant.Core;
+
+public sealed record ArchiveTaskResult(ArchiveRequest Request, ArchiveResult Result);
+public sealed record ArchiveBatchResult(IReadOnlyList<ArchiveTaskResult> Results, bool Cancelled)
+{
+    public int CompletedCount => Results.Count(r => r.Result.Status == JobStatus.Completed);
+    public int FailedCount => Results.Count(r => r.Result.Status == JobStatus.Failed);
+}
+
+public sealed class SerialArchiveQueue(IArchiveEngine engine)
+{
+    public async Task<ArchiveBatchResult> RunAsync(IReadOnlyList<ArchiveRequest> requests,
+        Action<ArchiveRequest>? onStarted = null, Action<ArchiveRequest, ArchiveResult>? onCompleted = null,
+        Func<ArchiveRequest, IProgress<ArchiveProgress>?>? progressFactory = null,
+        Action<Exception>? onObserverError = null, CancellationToken cancellationToken = default)
+    {
+        var results = new List<ArchiveTaskResult>();
+        var cancelled = false;
+        foreach (var request in requests)
+        {
+            if (cancellationToken.IsCancellationRequested) { cancelled = true; break; }
+            Notify(() => onStarted?.Invoke(request), onObserverError);
+            IProgress<ArchiveProgress>? progress = null;
+            Notify(() => progress = progressFactory?.Invoke(request), onObserverError);
+            ArchiveResult result;
+            try { result = await engine.ExecuteAsync(request, progress, cancellationToken); }
+            catch (OperationCanceledException) { result = new(JobStatus.Cancelled, null, ArchiveOutputKind.File); }
+            catch (Exception)
+            {
+                result = new(JobStatus.Failed, null, ArchiveOutputKind.File,
+                    new("archive.unexpected", Locale.T("压缩包处理遇到了问题。"), Locale.T("请确认文件可读取，并重试。")));
+            }
+            results.Add(new(request, result));
+            Notify(() => onCompleted?.Invoke(request, result), onObserverError);
+            if (result.Status == JobStatus.Cancelled || cancellationToken.IsCancellationRequested) { cancelled = true; break; }
+        }
+        return new(results.AsReadOnly(), cancelled);
+    }
+    private static void Notify(Action callback, Action<Exception>? observer)
+    {
+        try { callback(); } catch (Exception error) { try { observer?.Invoke(error); } catch (Exception) { } }
+    }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/SerialConversionQueue.cs ---
+namespace CatFileAssistant.Core;
+
+public sealed record QueueTaskResult(ConversionRequest Request, ConversionResult Result);
+public sealed record QueueBatchResult(IReadOnlyList<QueueTaskResult> Results, bool Cancelled)
+{
+    public int CompletedCount => Results.Count(value => value.Result.Status == JobStatus.Completed);
+    public int FailedCount => Results.Count(value => value.Result.Status == JobStatus.Failed);
+    public AssistantState AssistantState => Cancelled ? AssistantState.IDLE : AssistantStateRules.ForBatch(Results.Select(value => value.Result.Status));
+}
+
+/// <summary>Portable sequential task orchestration. No UI types, file deletion, or translated status text.</summary>
+public sealed class SerialConversionQueue(IConversionEngine engine)
+{
+    public async Task<QueueBatchResult> RunAsync(
+        IReadOnlyList<ConversionRequest> requests,
+        Action<ConversionRequest>? onStarted = null,
+        Action<ConversionRequest, ConversionResult>? onCompleted = null,
+        Func<ConversionRequest, IProgress<ConversionProgress>?>? progressFactory = null,
+        Action<Exception>? onObserverError = null,
+        CancellationToken cancellationToken = default)
+    {
+        var outcomes = new List<QueueTaskResult>();
+        var cancelled = false;
+        foreach (var request in requests)
+        {
+            if (cancellationToken.IsCancellationRequested) { cancelled = true; break; }
+            Notify(() => onStarted?.Invoke(request), onObserverError);
+            IProgress<ConversionProgress>? progress = null;
+            Notify(() => progress = progressFactory?.Invoke(request), onObserverError);
+            ConversionResult result;
+            try { result = await engine.ConvertAsync(request, progress, cancellationToken); }
+            catch (OperationCanceledException) { result = new(JobStatus.Cancelled, null, null); }
+            catch (ConversionEngineException exception) { result = new(JobStatus.Failed, null, exception.Error); }
+            catch (Exception exception)
+            {
+                result = new(JobStatus.Failed, null, new ConversionError("ENGINE_UNEXPECTED", Locale.T("这个文件好像遇到了一点问题。"), Locale.T("请重试，或换一种输出格式。"), TechnicalDetails: exception.ToString()));
+            }
+            outcomes.Add(new QueueTaskResult(request, result));
+            Notify(() => onCompleted?.Invoke(request, result), onObserverError);
+            if (result.Status == JobStatus.Cancelled || cancellationToken.IsCancellationRequested) { cancelled = true; break; }
+        }
+        return new QueueBatchResult(outcomes.AsReadOnly(), cancelled);
+    }
+
+    private static void Notify(Action notification, Action<Exception>? onObserverError)
+    {
+        try { notification(); }
+        catch (Exception exception)
+        {
+            // An observer cannot make an already committed output a failed conversion.
+            try { onObserverError?.Invoke(exception); }
+            catch (Exception) { }
+        }
+    }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/SerialImageObfuscationQueue.cs ---
+namespace CatFileAssistant.Core;
+
+public sealed record ImageObfuscationTaskResult(ImageObfuscationRequest Request, ImageObfuscationResult Result);
+public sealed record ImageObfuscationBatchResult(IReadOnlyList<ImageObfuscationTaskResult> Results, bool Cancelled)
+{
+    public int CompletedCount => Results.Count(value => value.Result.Status == JobStatus.Completed);
+    public int FailedCount => Results.Count(value => value.Result.Status == JobStatus.Failed);
+    public AssistantState AssistantState => Cancelled ? AssistantState.IDLE
+        : AssistantStateRules.ForBatch(Results.Select(value => value.Result.Status));
+}
+
+public sealed class SerialImageObfuscationQueue(IImageObfuscationEngine engine)
+{
+    public async Task<ImageObfuscationBatchResult> RunAsync(IReadOnlyList<ImageObfuscationRequest> requests,
+        Action<ImageObfuscationRequest>? onStarted = null,
+        Action<ImageObfuscationRequest, ImageObfuscationResult>? onCompleted = null,
+        Func<ImageObfuscationRequest, IProgress<ImageObfuscationProgress>?>? progressFactory = null,
+        Action<Exception>? onObserverError = null, CancellationToken cancellationToken = default)
+    {
+        var results = new List<ImageObfuscationTaskResult>();
+        var cancelled = false;
+        foreach (var request in requests)
+        {
+            if (cancellationToken.IsCancellationRequested) { cancelled = true; break; }
+            Notify(() => onStarted?.Invoke(request), onObserverError);
+            IProgress<ImageObfuscationProgress>? progress = null;
+            Notify(() => progress = progressFactory?.Invoke(request), onObserverError);
+            ImageObfuscationResult result;
+            try { result = await engine.ProcessAsync(request, progress, cancellationToken); }
+            catch (OperationCanceledException) { result = new(JobStatus.Cancelled, null, null); }
+            catch (ConversionEngineException error) { result = new(JobStatus.Failed, null, error.Error); }
+            catch (Exception error)
+            {
+                result = new(JobStatus.Failed, null, new("image.unexpected", Locale.T("这张图片暂时无法处理。"),
+                    Locale.T("请确认图片完整后重试。"), TechnicalDetails: error.ToString()));
+            }
+            results.Add(new(request, result));
+            Notify(() => onCompleted?.Invoke(request, result), onObserverError);
+            if (result.Status == JobStatus.Cancelled || cancellationToken.IsCancellationRequested)
+            { cancelled = true; break; }
+        }
+        return new(results.AsReadOnly(), cancelled);
+    }
+
+    private static void Notify(Action callback, Action<Exception>? observer)
+    {
+        try { callback(); }
+        catch (Exception error) { try { observer?.Invoke(error); } catch (Exception) { } }
+    }
+}
+
+
+--- ORIGINAL FILE: src/CatFileAssistant.Core/SerialRecoveryQueue.cs ---
+namespace CatFileAssistant.Core;
+
+public sealed record RecoveryTaskResult(RecoveryRequest Request, RecoveryResult Result);
+public sealed record RecoveryBatchResult(IReadOnlyList<RecoveryTaskResult> Results, bool Cancelled)
+{
+    public int FoundCount => Results.Count(r => r.Result.Status == RecoveryStatus.Found);
+    public int ExhaustedCount => Results.Count(r => r.Result.Status == RecoveryStatus.Exhausted);
+    public int FailedCount => Results.Count(r => r.Result.Status == RecoveryStatus.Failed);
+}
+public sealed class SerialRecoveryQueue(IPasswordRecoveryEngine engine)
+{
+    public async Task<RecoveryBatchResult> RunAsync(IReadOnlyList<RecoveryRequest> requests,
+        Action<RecoveryRequest>? onStarted = null, Action<RecoveryRequest, RecoveryResult>? onCompleted = null,
+        Func<RecoveryRequest, IProgress<RecoveryProgress>?>? progressFactory = null,
+        Action<Exception>? onObserverError = null, CancellationToken cancellationToken = default)
+    {
+        var results = new List<RecoveryTaskResult>(); var cancelled = false;
+        foreach (var request in requests)
+        {
+            if (cancellationToken.IsCancellationRequested) { cancelled = true; break; }
+            Notify(() => onStarted?.Invoke(request), onObserverError);
+            IProgress<RecoveryProgress>? progress = null;
+            Notify(() => progress = progressFactory?.Invoke(request), onObserverError);
+            RecoveryResult result;
+            try { result = await engine.RecoverAsync(request, progress, cancellationToken); }
+            catch (OperationCanceledException) { result = new(RecoveryStatus.Cancelled); }
+            catch (Exception) { result = new(RecoveryStatus.Failed, Error: new("recovery.unexpected", Locale.T("密码恢复遇到了问题。"), Locale.T("请确认压缩包可读取后重试。"))); }
+            results.Add(new(request, result)); Notify(() => onCompleted?.Invoke(request, result), onObserverError);
+            if (result.Status == RecoveryStatus.Cancelled || cancellationToken.IsCancellationRequested) { cancelled = true; break; }
+        }
+        return new(results.AsReadOnly(), cancelled);
+    }
+    private static void Notify(Action callback, Action<Exception>? observer)
+    { try { callback(); } catch (Exception e) { try { observer?.Invoke(e); } catch (Exception) { } } }
+}
+

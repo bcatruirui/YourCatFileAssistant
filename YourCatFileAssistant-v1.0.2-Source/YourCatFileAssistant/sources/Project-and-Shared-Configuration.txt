@@ -1,0 +1,537 @@
+
+--- ORIGINAL FILE: .gitignore ---
+# Generated outputs and private development state
+**/bin/
+**/obj/
+**/__pycache__/
+*.py[cod]
+.vs/
+.idea/
+.vscode/
+.build/
+.dotnet-home/
+artifacts/
+release/
+*.user
+*.suo
+*.log
+*.binlog
+*.dmp
+.env
+.env.*
+*.pfx
+*.p12
+*.key
+# Restorable tools and caches
+tools/dotnet/*
+!tools/dotnet/licenses/
+tools/7zip/bin/
+tools/7zip/downloads/
+tools/7zip/source/
+tools/ffmpeg/bin/
+tools/ffmpeg/downloads/
+tools/ffmpeg/source/dependency-archives/
+tools/ffmpeg/source/rust-crates/
+tools/ffmpeg/source/repository-cache/
+tools/ffmpeg/source/FFmpeg-*/
+tools/ffmpeg/source/FFmpeg-Builds-*/
+tools/ffmpeg/source/FFmpeg-*.tar.gz
+!tools/ffmpeg/source/FFmpeg-Builds-*.tar.gz
+tools/innosetup/
+*.partial
+# Historical execution evidence may include personal information
+docs/validation-evidence/**
+!docs/validation-evidence/README.md
+
+
+--- ORIGINAL FILE: BUILD-STATUS.md ---
+# 本轻量源码包的验证状态
+
+- 应用版本：1.0.2。
+- Windows x64 独立副本中，使用经 SHA-512 核对的原 .NET SDK 10.0.401 归档和现有离线 .NET 缓存，重建了 Core、Infrastructure、ArchiveWorker、Desktop 和 Acceptance 五个项目；Release 编译 0 警告、0 错误。
+- 通过本包的依赖恢复脚本，从原同版完整配套 ZIP 恢复并校验了 12 个原生依赖/源码文件。没有从原项目复用 bin/obj 或旧应用 DLL。
+- 可选本地化维护程序也在独立副本中重新构建并运行 validate：目录 1,250 项、0 错误。
+- 本次关闭 NuGet 在线漏洞审计，使用本地已有的固定依赖缓存；没有证明全新开发机能够从当前网络自动下载全部依赖。特别是原 FFmpeg 历史链接返回 404，发布者仍需提供固定配套包或长期镜像。
+- 应用 src 和 shared 的全部文件内容与原项目逐字节比对。原始猫咪/图标/动画资源未降质或修改；测试源码和素材保留，来源路径脱敏。额外的手写本地化工具从 .build 移至 scripts，修改仅涉及开发工具输出路径和来源路径脱敏。
+- 未重新执行完整应用功能/GUI/性能验收、安装/卸载验收，未重编译 FFmpeg 或 7-Zip 原生引擎。
+- 本 ZIP 不附带 .NET SDK、FFmpeg/7-Zip 二进制及大型对应源归档；恢复依赖后可重新编译应用。第三方对应源码发行义务见 docs/source-distribution.md。
+- 项目原创部分新增 MIT LICENSE，既有第三方及 LGPL 组件许可不变。没有提交或推送 GitHub。
+
+- 本次调整仅涉及授权、说明、第三方材料去重及打包；应用源码和全部图像素材保持原始字节。之前的重编译结果仍适用于这些相同的功能代码，没有声称本次重新执行 GUI 验收。
+
+
+--- ORIGINAL FILE: CatFileAssistant.sln ---
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{827E0CD3-B72D-47B6-A68D-7590B98EB39B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CatFileAssistant.Core", "src\CatFileAssistant.Core\CatFileAssistant.Core.csproj", "{B75EB164-2034-4E8F-8232-4E6F0CE1956D}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CatFileAssistant.Infrastructure", "src\CatFileAssistant.Infrastructure\CatFileAssistant.Infrastructure.csproj", "{88E48760-B4C4-408E-B98A-457C0406525F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CatFileAssistant.Desktop", "src\CatFileAssistant.Desktop\CatFileAssistant.Desktop.csproj", "{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0AB3BF05-4346-4AA6-1389-037BE0695223}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CatFileAssistant.Acceptance", "tests\CatFileAssistant.Acceptance\CatFileAssistant.Acceptance.csproj", "{2419865B-6915-4DE8-8A55-C4624589855D}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CatFileAssistant.ArchiveWorker", "src\CatFileAssistant.ArchiveWorker\CatFileAssistant.ArchiveWorker.csproj", "{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|Any CPU = Release|Any CPU
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Debug|x64.Build.0 = Debug|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Debug|x86.Build.0 = Debug|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Release|x64.ActiveCfg = Release|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Release|x64.Build.0 = Release|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Release|x86.ActiveCfg = Release|Any CPU
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D}.Release|x86.Build.0 = Release|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Debug|x64.Build.0 = Debug|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Debug|x86.Build.0 = Debug|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Release|x64.ActiveCfg = Release|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Release|x64.Build.0 = Release|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Release|x86.ActiveCfg = Release|Any CPU
+		{88E48760-B4C4-408E-B98A-457C0406525F}.Release|x86.Build.0 = Release|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Debug|x64.Build.0 = Debug|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Debug|x86.Build.0 = Debug|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Release|Any CPU.Build.0 = Release|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Release|x64.ActiveCfg = Release|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Release|x64.Build.0 = Release|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Release|x86.ActiveCfg = Release|Any CPU
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580}.Release|x86.Build.0 = Release|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Debug|x64.Build.0 = Debug|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Debug|x86.Build.0 = Debug|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Release|x64.ActiveCfg = Release|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Release|x64.Build.0 = Release|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Release|x86.ActiveCfg = Release|Any CPU
+		{2419865B-6915-4DE8-8A55-C4624589855D}.Release|x86.Build.0 = Release|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Debug|x64.Build.0 = Debug|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Debug|x86.Build.0 = Debug|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Release|x64.ActiveCfg = Release|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Release|x64.Build.0 = Release|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Release|x86.ActiveCfg = Release|Any CPU
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7}.Release|x86.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{B75EB164-2034-4E8F-8232-4E6F0CE1956D} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{88E48760-B4C4-408E-B98A-457C0406525F} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{30FE7CC0-0EA0-4A90-8C12-5DE56EBDE580} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{2419865B-6915-4DE8-8A55-C4624589855D} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
+		{9DCA010A-8141-471C-A29A-63FFEAE9F0C7} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+	EndGlobalSection
+EndGlobal
+
+
+--- ORIGINAL FILE: Directory.Build.props ---
+<Project>
+  <PropertyGroup>
+    <RestoreConfigFile>$(MSBuildThisFileDirectory)NuGet.Config</RestoreConfigFile>
+    <RestorePackagesPath>$(MSBuildThisFileDirectory)tools\dotnet\packages</RestorePackagesPath>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+</Project>
+
+
+--- ORIGINAL FILE: global.json ---
+{
+  "sdk": {
+    "version": "10.0.401",
+    "rollForward": "disable"
+  }
+}
+
+
+--- ORIGINAL FILE: NuGet.Config ---
+<?xml version="1.0" encoding="utf-8"?>
+<configuration><packageSources><clear /><add key="nuget.org" value="https://api.nuget.org/v3/index.json" /></packageSources></configuration>
+
+
+--- ORIGINAL FILE: README.md ---
+# 你的猫咪文件助手 · YourCatFileAssistant v1.0.2
+
+Windows 本地文件工具与桌面猫咪助手，支持中英文界面。本 ZIP 是轻量、脱敏的**应用源码开发包**，不包含安装程序、.NET SDK、运行时、FFmpeg/7-Zip 二进制或第三方引擎源码归档。猫咪素材、UI、应用功能代码及测试样本完整保留。
+
+## 项目结构
+
+- `src/CatFileAssistant.Desktop`：C# / WPF 界面、桌宠、图标及 PNG/JSON 素材。
+- `src/CatFileAssistant.Core`：核心模型、规则、双语文本。
+- `src/CatFileAssistant.Infrastructure`：文件处理、配置、进程适配。
+- `src/CatFileAssistant.ArchiveWorker`：独立归档工作进程及 7-Zip 互操作；保留 LGPL-2.1-or-later 声明。
+- `shared`：共享配置、设计参数与原创恢复规则。
+- `tests`：不依赖第三方测试框架的验收程序和固定测试素材；测试密码只是公开测试数据。
+- `scripts`：依赖恢复、构建、验收及安装打包工具；`LocalizationMaintenance` 保留原先藏在 `.build` 下的本地化维护源码和翻译材料。
+- `tools`：依赖来源、固定版本/哈希、许可和对应源码索引，不含已安装依赖。
+- `docs`：架构、功能、设计与历史说明。历史运行报告、机器资料、截图和录屏因隐私未公开。
+
+## 构建依赖
+
+Windows x64；.NET SDK **10.0.401**（`global.json` 精确固定）；Python 3.11+；PowerShell 7（推荐）。应用使用 .NET 10 / WPF，无第三方 NuGet `PackageReference`；仍需由 SDK/NuGet 恢复 .NET 目标框架引用及必要的运行时包。NuGet 源仅 nuget.org，缓存写在当前项目 `tools/dotnet` 中。
+
+运行依赖：固定 FFmpeg `n9.0.2-14-gebafaee10a-20260929` 和 7-Zip **26.04 x64**，详细 URL 与 SHA-256 见 `tools/*/provenance.json`。现有 FFmpeg 历史 URL 在本次联网检查返回 404，不能保证其仍可自动下载；脚本不会用 `latest` 静默替代。
+
+### 恢复依赖
+
+```powershell
+# 安装上述 Python / PowerShell，并准备一个可用的固定 SDK，或让脚本下载 SDK。
+# 有固定上游下载归档时：
+./scripts/restore-dependencies.ps1 -FfmpegArchive 'X:/downloads/pinned-ffmpeg.zip' -SevenZipArchive 'X:/downloads/7z2604-x64.exe' -ExtractorPath 'X:/7zip/7z.exe'
+
+# 推荐的离线恢复：从维护者另行提供的同版完整源码/依赖包中，按哈希恢复引擎。
+./scripts/restore-dependencies.ps1 -SourceCompanion 'X:/downloads/你的猫咪文件助手-V1.0.2-Windows-x64-Sources.zip'
+```
+
+没有提供本地文件时，恢复脚本会尝试固定上游 URL，下载失败会明确终止。不要执行下载的 7-Zip 安装程序：脚本仅作为归档解包。直接恢复 7-Zip 需要开发机已安装 7-Zip 并通过 `-ExtractorPath` 指定；从完整配套包恢复时不需要额外解包器。
+
+SDK 可预先安装在 PATH 或 `tools/dotnet/sdk`。若下载不通，可将微软对应 SDK ZIP 按 `scripts/bootstrap-sdk.ps1` 的 SHA-512 校验后解压到后者。使用系统 SDK 时可传 `-SkipSdk`。
+
+完整配套包是维护者需要另行提供的较大文件；本轻量包不含它，也没有编造尚不存在的公开下载地址。发布者应在 GitHub Releases 同时提供可用的配套材料或长期镜像，否则新开发者可能无法取得已经下架的固定 FFmpeg。
+
+### 重新构建应用与测试程序
+
+```powershell
+./scripts/build.ps1
+# 恢复的依赖验证后进行 Release 编译；源代码功能和 UI 未修改。
+# 运行实际 GUI 验收（耗时较长，需要交互桌面）：
+./scripts/build.ps1 -RunTests
+# 快速开发检查，不能当成完整发行验收：
+./scripts/build.ps1 -RunTests -Quick
+```
+
+产物在 `src/*/bin/Release`。桌面入口为 `src/CatFileAssistant.Desktop/bin/Release/net10.0-windows/YourCatFileAssistant.exe`，构建会复制引擎与归档工作进程。
+
+### 安装包与正式二进制发行
+
+仅重建应用不需要重新编译 FFmpeg。若要重建 FFmpeg，需按其固定构建配方使用 Bash/Docker，并恢复对应源码、依赖、子模块及 Rust crate；本次没有验证重建原始原生引擎。
+
+```powershell
+# 准备已有同版完整配套包，同时恢复全部对应源码材料：
+./scripts/restore-dependencies.ps1 -SourceCompanion 'X:/downloads/你的猫咪文件助手-V1.0.2-Windows-x64-Sources.zip' -IncludeCorrespondingSources
+# 执行既有严格审计和发布流程；需要联网恢复自包含 .NET 运行时。
+./scripts/publish.ps1
+```
+
+安装 EXE 另需脚本固定的 Inno Setup 7.1.0（`bootstrap-installer.ps1` 下载、校验并在项目内安装便携编译器）；本次没有重新验证安装/卸载或完整二进制发布流程。
+
+不要将本小 ZIP 标作附带原生引擎二进制的“全部对应源码”。二进制发行仍须提供匹配的完整第三方对应源码与原始许可证，不能只有容易失效的上游链接。详见 [第三方发行边界](docs/source-distribution.md)。
+
+### 再次打包轻量源码
+
+```powershell
+python -B scripts/package-source.py 'X:/output/YourCatFileAssistant-v1.0.2-Source.zip'
+```
+
+白名单打包排除恢复的引擎、SDK/NuGet、编译产物、缓存、历史执行记录及 Git 数据库；运行前仍需审查自行新增的个人文件。ZIP 文件时间统一，清单内不记录本机路径。
+
+## 许可状态与隐私
+
+维护者有权授权的原创项目部分采用根目录 **MIT LICENSE**，允许商业使用。现有第三方代码、归档工作进程及辅助代码的 LGPL/BSD/MIT 等许可保留；MIT 不取代这些条款，范围见 `LICENSE-SCOPE.md`。主动展示的作者名、邮箱及 BiliBili 联系方式保留。详见 `THIRD-PARTY-NOTICES.md`、`docs/source-distribution.md` 和 `docs/public-source-privacy.md`。
+
+本次验证结论见 `BUILD-STATUS.md`；不能将历史验收数字当成本轻量源码包重新执行的结果。
+
+## 本地化维护工具
+
+从项目根目录执行（需要 `tools/dotnet/sdk` 下的固定 SDK，工具引用其 Roslyn 程序集）：
+
+```powershell
+./tools/dotnet/sdk/dotnet.exe run --project scripts/LocalizationMaintenance/Rewrite.csproj -c Release -- validate
+./tools/dotnet/sdk/dotnet.exe run --project scripts/LocalizationMaintenance/Rewrite.csproj -c Release -- audit
+```
+
+`validate` 检查目录；`audit` 将缺失项写到 `artifacts/localization`。不传模式会执行原始本地化重写功能，可能改变开发副本源码；日常构建无需执行。
+
+## 25 MB 解压体积说明
+
+发布 ZIP 的全部条目解压后的文件总大小（包括逐文件清单）也限定在 25,000,000 字节内；这是文件内容大小，不是特定文件系统分配簇的占用空间。依赖安装、编译后产生的 SDK、原生引擎、缓存和输出会另外占用空间，不属于此源码包体积。
+
+第三方许可合并保留索引和必要声明；不影响程序源码与素材。大型历史依赖/构建索引及可再生成的本地化语料快照未放入小包；完整二进制发行前从原配套包恢复相应材料。当前翻译目录和本地化维护源码保留。
+
+
+--- ORIGINAL FILE: shared/design-tokens.json ---
+{
+  "version": 3,
+  "themes": {
+    "light": {
+      "background": "#F5F6F8",
+      "surface": "#FFFFFF",
+      "text": "#20242C",
+      "muted": "#68717E",
+      "accent": "#2864DC",
+      "onAccent": "#FFFFFF",
+      "accentHover": "#235ACA",
+      "accentPressed": "#1E4EB0",
+      "softSurface": "#EDF0F5",
+      "hoverSurface": "#E7EDF8",
+      "pressedSurface": "#DDE6F6",
+      "border": "#E2E6ED",
+      "strongBorder": "#BBC4D1",
+      "accentTint": "#EAF0FF",
+      "accentBorder": "#B8CDF7",
+      "focusBorder": "#2864DC",
+      "success": "#27765A",
+      "successTint": "#E8F4EE",
+      "warning": "#966023",
+      "warningTint": "#FCF1DF",
+      "danger": "#B53E45",
+      "onDanger": "#B53E45",
+      "dangerTint": "#FCECEE",
+      "dangerHover": "#F8E0E3",
+      "dangerPressed": "#F1D2D7",
+      "disabledText": "#9199A6",
+      "selectionBackground": "#EAF0FF",
+      "selectionText": "#20242C",
+      "shadow": "#0C172A",
+      "scrim": "#300C172A"
+    },
+    "dark": {
+      "background": "#17191E",
+      "surface": "#23262D",
+      "text": "#EEF0F4",
+      "muted": "#A7B0BF",
+      "accent": "#82AAFF",
+      "onAccent": "#142037",
+      "accentHover": "#96B8FF",
+      "accentPressed": "#6C98F2",
+      "softSurface": "#2D313A",
+      "hoverSurface": "#343C4C",
+      "pressedSurface": "#3B465C",
+      "border": "#343944",
+      "strongBorder": "#596478",
+      "accentTint": "#293B5D",
+      "accentBorder": "#4A6592",
+      "focusBorder": "#82AAFF",
+      "success": "#85D0AD",
+      "successTint": "#243D33",
+      "warning": "#E6BF81",
+      "warningTint": "#443724",
+      "danger": "#F59A9F",
+      "onDanger": "#F59A9F",
+      "dangerTint": "#442D34",
+      "dangerHover": "#50323B",
+      "dangerPressed": "#5F3843",
+      "disabledText": "#758090",
+      "selectionBackground": "#293B5D",
+      "selectionText": "#EEF0F4",
+      "shadow": "#000000",
+      "scrim": "#80000000"
+    }
+  },
+  "spacing": {
+    "xsmall": 4,
+    "small": 8,
+    "compact": 12,
+    "medium": 16,
+    "large": 24,
+    "xlarge": 32
+  },
+  "radius": {
+    "button": 10,
+    "input": 8,
+    "card": 16,
+    "dropArea": 18,
+    "dialog": 18
+  },
+  "motion": {
+    "hoverDurationMs": 140,
+    "pressDurationMs": 100,
+    "releaseDurationMs": 140,
+    "menuDurationMs": 180,
+    "pageDurationMs": 220,
+    "selectionDurationMs": 160,
+    "progressDurationMs": 150,
+    "rowEntranceDurationMs": 160,
+    "dialogDurationMs": 200,
+    "successDurationMs": 600,
+    "idleBlinkMinMs": 4000,
+    "idleBlinkMaxMs": 7000,
+    "sleepAfterMs": 120000,
+    "repeat": false,
+    "respectReducedMotion": true
+  },
+  "typography": {
+    "windowsFont": "Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI, Microsoft YaHei, Global User Interface",
+    "bodySize": 14,
+    "bodyLineHeight": 22,
+    "captionSize": 12,
+    "captionLineHeight": 18,
+    "titleSize": 24,
+    "titleLineHeight": 32,
+    "sectionSize": 18,
+    "sectionLineHeight": 26,
+    "buttonSize": 14,
+    "numericSize": 14,
+    "controlMinHeight": 36
+  }
+}
+
+
+--- ORIGINAL FILE: shared/presets.json ---
+[
+  { "id": "mp4-h264", "name": "MP4 · H.264（兼容性优先）", "extension": "mp4", "codec": "h264-open", "mode": "Video", "container": "mp4", "expectedCodec": "h264" },
+  { "id": "mp4-h265", "name": "MP4 · H.265（高效压缩）", "extension": "mp4", "codec": "hevc-kv", "mode": "Video", "container": "mp4", "expectedCodec": "hevc" },
+  { "id": "mkv-h264", "name": "MKV · H.264", "extension": "mkv", "codec": "h264-open", "mode": "Video", "container": "matroska", "expectedCodec": "h264" },
+  { "id": "mkv-h265", "name": "MKV · H.265", "extension": "mkv", "codec": "hevc-kv", "mode": "Video", "container": "matroska", "expectedCodec": "hevc" },
+  { "id": "webm-vp9", "name": "WebM · VP9", "extension": "webm", "codec": "vp9", "mode": "Video", "container": "webm", "expectedCodec": "vp9" },
+  { "id": "avi-mpeg4", "name": "AVI · MPEG-4", "extension": "avi", "codec": "mpeg4", "mode": "Video", "container": "avi", "expectedCodec": "mpeg4" },
+  { "id": "mp3", "name": "MP3 · 通用音频", "extension": "mp3", "codec": "mp3", "mode": "Audio", "container": "mp3", "expectedCodec": "mp3" },
+  { "id": "aac", "name": "AAC · M4A", "extension": "m4a", "codec": "aac", "mode": "Audio", "container": "mp4", "expectedCodec": "aac" },
+  { "id": "wav", "name": "WAV · 无损 PCM", "extension": "wav", "codec": "wav", "mode": "Audio", "container": "wav", "expectedCodec": "pcm_s16le" },
+  { "id": "flac", "name": "FLAC · 无损压缩", "extension": "flac", "codec": "flac", "mode": "Audio", "container": "flac", "expectedCodec": "flac" },
+  { "id": "jpg", "name": "JPG · 常用图片", "extension": "jpg", "codec": "jpg", "mode": "Image", "container": "image", "expectedCodec": "mjpeg" },
+  { "id": "png", "name": "PNG · 清晰无损", "extension": "png", "codec": "png", "mode": "Image", "container": "image", "expectedCodec": "png" },
+  { "id": "webp", "name": "WebP · 轻量图片", "extension": "webp", "codec": "webp", "mode": "Image", "container": "image", "expectedCodec": "webp" },
+  { "id": "bmp", "name": "BMP · 位图", "extension": "bmp", "codec": "bmp", "mode": "Image", "container": "image", "expectedCodec": "bmp" },
+  { "id": "extract-mp3", "name": "MP3 · 提取音频", "extension": "mp3", "codec": "mp3", "mode": "Extract", "container": "mp3", "expectedCodec": "mp3" },
+  { "id": "extract-aac", "name": "AAC · M4A", "extension": "m4a", "codec": "aac", "mode": "Extract", "container": "mp4", "expectedCodec": "aac" },
+  { "id": "extract-wav", "name": "WAV · 无损 PCM", "extension": "wav", "codec": "wav", "mode": "Extract", "container": "wav", "expectedCodec": "pcm_s16le" },
+  { "id": "extract-flac", "name": "FLAC · 无损压缩", "extension": "flac", "codec": "flac", "mode": "Extract", "container": "flac", "expectedCodec": "flac" },
+  { "id": "video-gif", "name": "GIF · 视频动图", "extension": "gif", "codec": "gif", "mode": "Gif", "container": "gif", "expectedCodec": "gif" }
+]
+
+
+--- ORIGINAL FILE: shared/recovery-patterns-provenance.json ---
+{
+  "schemaVersion": 1,
+  "ruleVersion": "numeric-patterns-v1",
+  "origin": "Original deterministic numeric rules authored by CatFileAssistant contributors",
+  "externalDatasets": [],
+  "generator": "src/CatFileAssistant.Core/RecoveryContracts.cs",
+  "generatorSha256": "77F85AED666EE38C2A5F651A6A18DFB775B97CF0ED2C15BC8220132FC3D87F8B",
+  "rules": [
+    "10 identical-digit repetitions",
+    "10 cyclic ascending and 10 cyclic descending sequences",
+    "Repeated pairs 12,21,10,01,52,25,69,96"
+  ],
+  "lengths": {
+    "4": {
+      "count": 38,
+      "sha256Utf8Lines": "D9EF1DF3032833B1A59F4048FB66DF27C41EFCD54A8B2CACA8BF950DF0D57D71",
+      "patterns": [
+        "0000",
+        "1111",
+        "2222",
+        "3333",
+        "4444",
+        "5555",
+        "6666",
+        "7777",
+        "8888",
+        "9999",
+        "0123",
+        "1234",
+        "2345",
+        "3456",
+        "4567",
+        "5678",
+        "6789",
+        "7890",
+        "8901",
+        "9012",
+        "0987",
+        "1098",
+        "2109",
+        "3210",
+        "4321",
+        "5432",
+        "6543",
+        "7654",
+        "8765",
+        "9876",
+        "1212",
+        "2121",
+        "1010",
+        "0101",
+        "5252",
+        "2525",
+        "6969",
+        "9696"
+      ]
+    },
+    "6": {
+      "count": 38,
+      "sha256Utf8Lines": "4FF5DFA744DAB686BBE9FE3D572232B7AB3F0598035C50A9D598C0F17E2DA794",
+      "patterns": [
+        "000000",
+        "111111",
+        "222222",
+        "333333",
+        "444444",
+        "555555",
+        "666666",
+        "777777",
+        "888888",
+        "999999",
+        "012345",
+        "123456",
+        "234567",
+        "345678",
+        "456789",
+        "567890",
+        "678901",
+        "789012",
+        "890123",
+        "901234",
+        "098765",
+        "109876",
+        "210987",
+        "321098",
+        "432109",
+        "543210",
+        "654321",
+        "765432",
+        "876543",
+        "987654",
+        "121212",
+        "212121",
+        "101010",
+        "010101",
+        "525252",
+        "252525",
+        "696969",
+        "969696"
+      ]
+    }
+  }
+}
+
